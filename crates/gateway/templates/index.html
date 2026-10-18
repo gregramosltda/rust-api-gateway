@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sushi Tech Gateway — O Maître da sua operação</title>
+<!--
+  Tailwind via CDN: o dashboard é uma página de demonstração, não parte do
+  produto. Compilar CSS no pipeline do Rust adicionaria uma dependência de
+  Node a um projeto que não tem nenhuma, para servir uma página estática.
+  A troca é honesta: sem CDN, a página perde o acabamento e continua legível,
+  porque o bloco <style> abaixo cobre o essencial.
+-->
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  /* Reserva mínima, para o caso de o CDN não carregar. */
+  body { margin: 0; padding: 1.5rem; background: #020617; color: #e2e8f0;
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.5; }
+  h1 { font-size: 1.75rem; margin: 0 0 .25rem; }
+  section { border: 1px solid #1e293b; border-radius: .75rem; padding: 1rem; margin: 1rem 0; }
+  button { cursor: pointer; padding: .5rem 1rem; border-radius: .5rem; border: 0; font-weight: 600; }
+  code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; }
+  ul { padding-left: 1.25rem; }
+</style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+<div class="mx-auto max-w-6xl">
+
+  <!-- ===================== Cabeçalho ===================== -->
+  <header class="flex flex-wrap items-end justify-between gap-4 border-b border-slate-800 pb-5">
+    <div>
+      <h1 class="text-3xl font-black tracking-tight">
+        <span aria-hidden="true">🍣</span>
+        Sushi Tech Gateway
+        <span class="block text-lg font-semibold text-rose-400">O Maître da sua operação</span>
+      </h1>
+      <p class="mt-1 max-w-2xl text-sm text-slate-400">
+        Todo pedido passa pelo maître antes de chegar à cozinha. Ele conta quantas
+        vezes cada mesa pediu, guarda o que já está pronto e só então leva o pedido
+        adiante — em Rust, sem fila e sem espera desnecessária.
+      </p>
+    </div>
+    <button id="btn-status" type="button"
+            class="rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-700">
+      Reavaliar status
+    </button>
+  </header>
+
+  <!-- ===================== Status ===================== -->
+  <section class="grid gap-4 sm:grid-cols-3 border-0 p-0 mt-6">
+    <div id="status-gateway" class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+      <p class="text-xs uppercase tracking-wider text-slate-500">Gateway</p>
+      <p class="mt-1 text-lg font-bold">verificando…</p>
+      <p class="text-xs text-slate-500">via /health</p>
+    </div>
+    <div id="status-destino" class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+      <p class="text-xs uppercase tracking-wider text-slate-500">Cozinha (destino)</p>
+      <p class="mt-1 text-lg font-bold">verificando…</p>
+      <p class="text-xs text-slate-500">via /mock/health</p>
+    </div>
+    <div id="status-pronto" class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+      <p class="text-xs uppercase tracking-wider text-slate-500">Prontidão</p>
+      <p class="mt-1 text-lg font-bold">verificando…</p>
+      <p class="text-xs text-slate-500">via /ready</p>
+    </div>
+  </section>
+
+  <div class="mt-6 grid gap-6 lg:grid-cols-2">
+
+    <!-- ===================== Cardápio ===================== -->
+    <section class="rounded-xl border border-slate-800 bg-slate-900 p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-xl font-bold">Cardápio</h2>
+        <button id="btn-cardapio" type="button"
+                class="rounded-lg bg-rose-600 px-4 py-2 font-semibold hover:bg-rose-500">
+          Ver Cardápio
+        </button>
+      </div>
+      <p class="mt-2 text-sm text-slate-400">
+        Clique duas vezes seguidas: o segundo clique deve vir da memória do maître.
+        Ele não vai até a cozinha de novo.
+      </p>
+
+      <!-- Alerta de cache -->
+      <div id="alerta" role="status" aria-live="polite"
+           class="mt-4 hidden rounded-lg border-2 border-amber-400 bg-amber-400/10 px-4 py-3 font-bold text-amber-300"></div>
+
+      <dl class="mt-4 grid grid-cols-3 gap-3 text-center text-xs">
+        <div class="rounded-lg bg-slate-800/60 p-2">
+          <dt class="text-slate-400">Resposta</dt>
+          <dd id="metrica-cache" class="text-base font-bold">—</dd>
+        </div>
+        <div class="rounded-lg bg-slate-800/60 p-2">
+          <dt class="text-slate-400">Tempo</dt>
+          <dd id="metrica-tempo" class="text-base font-bold">—</dd>
+        </div>
+        <div class="rounded-lg bg-slate-800/60 p-2">
+          <dt class="text-slate-400">Idas à cozinha</dt>
+          <dd id="metrica-destino" class="text-base font-bold">—</dd>
+        </div>
+      </dl>
+
+      <ul id="lista-cardapio" class="mt-4 space-y-2 text-sm"></ul>
+    </section>
+
+    <!-- ===================== Rate limit ===================== -->
+    <section class="rounded-xl border border-slate-800 bg-slate-900 p-5">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-xl font-bold">Simular Ataque</h2>
+        <button id="btn-ataque" type="button"
+                class="rounded-lg bg-orange-600 px-4 py-2 font-semibold hover:bg-orange-500">
+          Disparar 10 requisições
+        </button>
+      </div>
+      <p class="mt-2 text-sm text-slate-400">
+        O maître conta as requisições por mesa e por rota. Passando do combinado,
+        a resposta é <code class="rounded bg-slate-800 px-1">429</code> — e a cozinha
+        nunca fica sabendo que houve tentativa.
+      </p>
+
+      <div class="mt-4">
+        <div class="flex justify-between text-xs text-slate-400">
+          <span>Orçamento da rota <code>/api/cardapio</code></span>
+          <span id="orcamento-texto">—</span>
+        </div>
+        <div class="mt-1 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+          <div id="orcamento-barra" class="h-full w-0 rounded-full bg-emerald-500 transition-all"></div>
+        </div>
+      </div>
+
+      <div id="resultado-ataque" class="mt-4 hidden"></div>
+    </section>
+
+    <!-- ===================== Pedido ===================== -->
+    <section class="rounded-xl border border-slate-800 bg-slate-900 p-5">
+      <h2 class="text-xl font-bold">Fazer Pedido</h2>
+      <p class="mt-2 text-sm text-slate-400">
+        Escrita não é cacheada, e o maître invalida o que tinha guardado para
+        aquele mesmo caminho: depois de uma escrita, o que estava em memória
+        pode não valer mais.
+      </p>
+
+      <form id="form-pedido" class="mt-4 space-y-3">
+        <div>
+          <label for="campo-item" class="block text-xs uppercase tracking-wider text-slate-500">Sushi</label>
+          <select id="campo-item"
+                  class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2">
+            <option value="">Carregue o cardápio primeiro</option>
+          </select>
+        </div>
+        <div>
+          <label for="campo-quantidade" class="block text-xs uppercase tracking-wider text-slate-500">Quantidade</label>
+          <input id="campo-quantidade" type="number" min="1" max="100" value="1"
+                 class="mt-1 w-32 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2" />
+        </div>
+        <button type="submit"
+                class="rounded-lg bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500">
+          Enviar pedido
+        </button>
+      </form>
+
+      <pre id="resposta-pedido"
+           class="mt-4 hidden overflow-x-auto rounded-lg bg-slate-950 p-3 text-xs text-emerald-300"></pre>
+    </section>
+
+    <!-- ===================== Log ===================== -->
+    <section class="rounded-xl border border-slate-800 bg-slate-900 p-5">
+      <h2 class="text-xl font-bold">O que o maître registrou</h2>
+      <p class="mt-2 text-sm text-slate-400">
+        Cada linha é um evento observado no navegador — nada aqui é escrito pelo
+        servidor.
+      </p>
+      <ol id="log" class="mt-4 space-y-1 text-xs text-slate-300"></ol>
+    </section>
+  </div>
+
+  <footer class="mt-8 border-t border-slate-800 pt-4 text-xs text-slate-500">
+    <p>
+      Rate limit e cache são do gateway, não do navegador. As chamadas usam
+      <code>cache: "no-store"</code> justamente para o navegador não esconder o
+      que o servidor respondeu — visite
+      <a class="underline hover:text-slate-300" href="/health">/health</a> e
+      <a class="underline hover:text-slate-300" href="/metrics">/metrics</a> para
+      ver os números crus.
+    </p>
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var brl = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+
+  function fmtPreco(centavos) {
+    return brl.format((Number(centavos) || 0) / 100);
+  }
+
+  function registrar(mensagem, cor) {
+    var lista = document.getElementById("log");
+    var item = document.createElement("li");
+    var hora = new Date().toLocaleTimeString("pt-BR");
+    item.className = "border-l-2 pl-2 " + (cor || "border-slate-600");
+    item.textContent = hora + " — " + mensagem;
+    lista.insertBefore(item, lista.firstChild);
+    while (lista.childElementCount > 40) {
+      lista.removeChild(lista.lastChild);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Status
+  // ---------------------------------------------------------------------
+  function pintarStatus(id, url, aoFalhar) {
+    var cartao = document.getElementById("status-" + id);
+    var titulo = cartao.querySelector("p:nth-child(2)");
+    fetch(url, { cache: "no-store" })
+      .then(function (r) {
+        var ok = r.ok;
+        return r.text().then(function (corpo) {
+          return { ok: ok, status: r.status, corpo: corpo };
+        });
+      })
+      .then(function (res) {
+        if (res.ok) {
+          cartao.className = "rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4";
+          titulo.textContent = "no ar";
+          titulo.className = "mt-1 text-lg font-bold text-emerald-400";
+        } else {
+          cartao.className = "rounded-xl border border-rose-500/40 bg-rose-500/10 p-4";
+          titulo.textContent = "indisponível (" + res.status + ")";
+          titulo.className = "mt-1 text-lg font-bold text-rose-400";
+        }
+      })
+      .catch(function () {
+        cartao.className = "rounded-xl border border-rose-500/40 bg-rose-500/10 p-4";
+        titulo.textContent = "sem resposta";
+        titulo.className = "mt-1 text-lg font-bold text-rose-400";
+        if (aoFalhar) { aoFalhar(); }
+      });
+  }
+
+  function checarStatus() {
+    pintarStatus("gateway", "/health");
+    pintarStatus("destino", "/mock/health");
+    pintarStatus("pronto", "/ready");
+    registrar("status reavaliado", "border-sky-500");
+  }
+
+  // ---------------------------------------------------------------------
+  // Orçamento de rate limit
+  // ---------------------------------------------------------------------
+  function mostrarOrcamento(resposta) {
+    var limite = resposta.headers.get("ratelimit-limit");
+    var restante = resposta.headers.get("ratelimit-remaining");
+    var texto = document.getElementById("orcamento-texto");
+    var barra = document.getElementById("orcamento-barra");
+
+    if (limite === null || restante === null) {
+      texto.textContent = "rate limit desligado nesta configuração";
+      barra.style.width = "0%";
+      return;
+    }
+
+    var l = Number(limite);
+    var r = Number(restante);
+    texto.textContent = r + " de " + l + " restantes nesta janela";
+    var pct = l > 0 ? Math.max(0, Math.min(100, (r / l) * 100)) : 0;
+    barra.style.width = pct + "%";
+    barra.className = "h-full rounded-full transition-all " +
+      (pct > 50 ? "bg-emerald-500" : pct > 20 ? "bg-amber-500" : "bg-rose-500");
+  }
+
+  // ---------------------------------------------------------------------
+  // Cardápio (demonstração de cache)
+  // ---------------------------------------------------------------------
+  function montarSelect(itens) {
+    var select = document.getElementById("campo-item");
+    select.innerHTML = "";
+    itens.forEach(function (item) {
+      var opt = document.createElement("option");
+      opt.value = item.nome;
+      opt.textContent = item.nome + " — " + fmtPreco(item.preco_centavos);
+      select.appendChild(opt);
+    });
+  }
+
+  function desenharCardapio(itens) {
+    var lista = document.getElementById("lista-cardapio");
+    lista.innerHTML = "";
+    if (!Array.isArray(itens) || itens.length === 0) {
+      var vazio = document.createElement("li");
+      vazio.className = "text-slate-500";
+      vazio.textContent = "Cardápio vazio.";
+      lista.appendChild(vazio);
+      return;
+    }
+    itens.forEach(function (item) {
+      var li = document.createElement("li");
+      li.className = "rounded-lg bg-slate-800/50 p-3";
+
+      var linha = document.createElement("div");
+      linha.className = "flex items-baseline justify-between gap-3";
+
+      var nome = document.createElement("span");
+      nome.className = "font-semibold";
+      nome.textContent = item.nome;
+
+      var preco = document.createElement("span");
+      preco.className = "font-mono text-rose-300";
+      preco.textContent = fmtPreco(item.preco_centavos);
+
+      var desc = document.createElement("p");
+      desc.className = "text-slate-400";
+      desc.textContent = item.descricao || "";
+
+      linha.appendChild(nome);
+      linha.appendChild(preco);
+      li.appendChild(linha);
+      li.appendChild(desc);
+      lista.appendChild(li);
+    });
+  }
+
+  function esconderAlerta() {
+    var alerta = document.getElementById("alerta");
+    alerta.classList.add("hidden");
+    alerta.textContent = "";
+  }
+
+  function mostrarAlerta(texto) {
+    var alerta = document.getElementById("alerta");
+    alerta.textContent = texto;
+    alerta.classList.remove("hidden");
+    registrar(texto, "border-amber-400");
+  }
+
+  function verCardapio() {
+    var botao = document.getElementById("btn-cardapio");
+    botao.disabled = true;
+    esconderAlerta();
+
+    var inicio = performance.now();
+    fetch("/api/cardapio", { cache: "no-store" })
+      .then(function (r) {
+        var ms = Math.round(performance.now() - inicio);
+        var origem = r.headers.get("x-cache");
+        mostrarOrcamento(r);
+
+        return r.json().then(function (corpo) {
+          return { status: r.status, ms: ms, origem: origem, corpo: corpo };
+        }, function () {
+          return { status: r.status, ms: ms, origem: origem, corpo: null };
+        });
+      })
+      .then(function (res) {
+        document.getElementById("metrica-tempo").textContent = res.ms + " ms";
+        document.getElementById("metrica-cache").textContent = res.origem || "—";
+
+        if (!res.corpo) {
+          registrar("cardápio recusado com status " + res.status, "border-rose-500");
+          if (res.status === 429) {
+            mostrarAlerta("Orçamento esgotado: a requisição foi barrada antes de chegar à cozinha.");
+          }
+          return;
+        }
+
+        document.getElementById("metrica-destino").textContent =
+          res.corpo.chamadas_ao_destino;
+        desenharCardapio(res.corpo.cardapio);
+        montarSelect(res.corpo.cardapio || []);
+        registrar("cardápio recebido (" + (res.origem || "sem status") + ") em " + res.ms + " ms",
+                  res.origem === "HIT" ? "border-amber-400" : "border-emerald-500");
+
+        if (res.origem === "HIT") {
+          mostrarAlerta("Resposta veio do Cache! (Muito rápido!)");
+        }
+      })
+      .catch(function (e) {
+        registrar("falha ao pedir o cardápio: " + e, "border-rose-500");
+      })
+      .then(function () {
+        botao.disabled = false;
+      });
+  }
+
+  // ---------------------------------------------------------------------
+  // Ataque (demonstração de rate limit)
+  // ---------------------------------------------------------------------
+  function simularAtaque() {
+    var botao = document.getElementById("btn-ataque");
+    botao.disabled = true;
+    var total = 10;
+
+    registrar("disparando " + total + " requisições simultâneas", "border-orange-500");
+
+    var disparos = [];
+    for (var i = 0; i < total; i++) {
+      disparos.push(
+        fetch("/api/cardapio", { cache: "no-store" }).then(function (r) {
+          // Consumir o corpo libera a conexão; sem isso o navegador segura o
+          // socket até o timeout e a medição fica suja.
+          return r.text().then(function () {
+            return { status: r.status, restante: r.headers.get("ratelimit-remaining") };
+          });
+        })
+      );
+    }
+
+    Promise.all(disparos)
+      .then(function (resultados) {
+        var passaram = resultados.filter(function (r) { return r.status === 200; }).length;
+        var barradas = resultados.filter(function (r) { return r.status === 429; }).length;
+        var outros = resultados.length - passaram - barradas;
+
+        var caixa = document.getElementById("resultado-ataque");
+        caixa.className = "mt-4 rounded-lg border border-slate-700 bg-slate-950 p-4";
+        caixa.innerHTML = "";
+
+        function linha(rotulo, valor, cor) {
+          var p = document.createElement("p");
+          p.className = "flex items-center justify-between " + (cor || "");
+          var a = document.createElement("span");
+          a.textContent = rotulo;
+          var b = document.createElement("span");
+          b.className = "font-mono font-bold";
+          b.textContent = valor;
+          p.appendChild(a);
+          p.appendChild(b);
+          caixa.appendChild(p);
+        }
+
+        linha("Chegaram à cozinha (200)", passaram, "text-emerald-400");
+        linha("Barradas pelo maître (429)", barradas, "text-rose-400");
+        if (outros > 0) {
+          linha("Outros status", outros, "text-amber-400");
+        }
+
+        var ultimo = resultados.filter(function (r) { return r.restante !== null; }).pop();
+        if (ultimo) {
+          var nota = document.createElement("p");
+          nota.className = "mt-2 text-xs text-slate-400";
+          nota.textContent = "Orçamento restante ao fim da rajada: " + ultimo.restante +
+            ". A janela desliza por tempo, não por relógio de parede: aguarde a janela virar para o limite liberar de novo.";
+          caixa.appendChild(nota);
+        }
+
+        registrar(total + " requisições: " + passaram + " passaram, " + barradas + " barradas",
+                  barradas > 0 ? "border-rose-500" : "border-emerald-500");
+      })
+      .catch(function (e) {
+        registrar("falha na rajada: " + e, "border-rose-500");
+      })
+      .then(function () {
+        botao.disabled = false;
+      });
+  }
+
+  // ---------------------------------------------------------------------
+  // Pedido
+  // ---------------------------------------------------------------------
+  function enviarPedido(evento) {
+    evento.preventDefault();
+
+    var item = document.getElementById("campo-item").value;
+    var quantidade = parseInt(document.getElementById("campo-quantidade").value, 10) || 1;
+
+    if (!item) {
+      registrar("carregue o cardápio antes de pedir", "border-amber-400");
+      return;
+    }
+
+    var saida = document.getElementById("resposta-pedido");
+    saida.classList.remove("hidden");
+    saida.textContent = "enviando…";
+
+    fetch("/api/pedido", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ item: item, quantidade: quantidade })
+    })
+      .then(function (r) {
+        mostrarOrcamento(r);
+        return r.text().then(function (texto) {
+          return { status: r.status, texto: texto };
+        });
+      })
+      .then(function (res) {
+        // Reexibe formatado quando o corpo é JSON; fora disso, mostra cru.
+        try {
+          saida.textContent = JSON.stringify(JSON.parse(res.texto), null, 2);
+        } catch (e) {
+          saida.textContent = res.texto;
+        }
+        registrar("pedido de " + quantidade + "× " + item + " → " + res.status,
+                  res.status === 201 ? "border-emerald-500" : "border-rose-500");
+      })
+      .catch(function (e) {
+        saida.textContent = "falha: " + e;
+        registrar("falha no pedido: " + e, "border-rose-500");
+      });
+  }
+
+  // ---------------------------------------------------------------------
+  // Ligações
+  // ---------------------------------------------------------------------
+  document.getElementById("btn-status").addEventListener("click", checarStatus);
+  document.getElementById("btn-cardapio").addEventListener("click", verCardapio);
+  document.getElementById("btn-ataque").addEventListener("click", simularAtaque);
+  document.getElementById("form-pedido").addEventListener("submit", enviarPedido);
+
+  checarStatus();
+  registrar("dashboard carregado", "border-sky-500");
+})();
+</script>
+</body>
+</html>

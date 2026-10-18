@@ -1,67 +1,90 @@
 # =============================================================================
-# Configuração do gateway.
+# Configuração do gateway — Sushi Tech.
 #
 # Nada aqui é padrão hardcoded no código: o binário lê este arquivo. Valores
-# ausentes usam o padrão do struct `Config`, que está documentado em
+# ausentes usam o padrão do struct `Config`, documentado em
 # `crates/common/src/config.rs`.
 #
 # Ao subir:  ./gateway config/gateway.toml
 # =============================================================================
 
 [server]
-# 127.0.0.1 por padrão: exposição em rede precisa ser decisão explícita.
-# Para uso em container ou atrás de proxy, troque por "0.0.0.0:8080".
+# 0.0.0.0 porque este também é o arquivo que roda em contêiner. Fora de
+# contêiner, "127.0.0.1:8080" é o padrão seguro.
+#
+# Em plataformas como serviço (Render, Fly, Heroku) a variável `PORT` tem
+# precedência sobre esta porta — e o destino embutido é realinhado junto, então
+# não há como as duas discordarem.
 bind_addr = "0.0.0.0:8080"
 shutdown_grace_seconds = 10
 
 [upstream]
-url = "http://127.0.0.1:9000"
+# O destino é o próprio gateway, sob `/mock`: é o que torna a demonstração
+# autocontida — um processo, sem serviço externo para subir antes.
+#
+# Com o simulador ligado, a porta desta URL é alinhada automaticamente à porta
+# de escuta real — inclusive quando a plataforma a define por `PORT`. Host e
+# caminho são respeitados; só a porta é corrigida. Sem o simulador, nada aqui é
+# tocado.
+#
+# Em produção: troque por "https://api.suarestaurante.com.br" (sem `/mock`) e
+# ponha `[mock] enabled = false`.
+url = "http://127.0.0.1:8080/mock"
 timeout_seconds = 30
 connect_timeout_seconds = 5
 
 [rate_limit]
-enabled = false
-redis_url = "redis://127.0.0.1:6379"
+enabled = true
+# "memory" limita por processo e dispensa serviço externo — é o que permite
+# esta demonstração rodar em qualquer lugar, inclusive sem Redis.
+#
+# Com mais de uma instância, troque por "redis" e aponte `redis_url` para um
+# Redis compartilhado. Com backend de memória, N instâncias entregam N vezes o
+# limite: o orçamento não é compartilhado.
+backend = "memory"
+redis_url = ""
 key_prefix = "ratelimit"
 default_limit = 100
 default_window_seconds = 60
-# `true`: Redis fora do ar libera o tráfego (prioriza disponibilidade).
+# `true`: backend fora do ar libera o tráfego (prioriza disponibilidade).
 # `false`: bloqueia (prioriza proteção). Não existe escolha neutra.
 fail_open = true
 
 [cache]
-enabled = false
+# Ligado: é o que faz o segundo clique em "Ver Cardápio" não chegar à cozinha.
+enabled = true
 max_capacity = 10000
 ttl_seconds = 30
-# Só verbos seguros. Um POST cacheado devolveria a resposta da escrita para
+# Só verbos seguros. Um POST cacheado devolveria a resposta da escrita para as
 # leituras seguintes — o oposto do esperado.
 cacheable_methods = ["GET", "HEAD"]
 
+[mock]
+# O restaurante simulado, servido pelo próprio processo sob `/mock/*`.
+enabled = true
+# Atraso do preparo, em milissegundos. É o que dá sentido à demonstração de
+# cache: sem atraso, resposta do cache e resposta da cozinha levam o mesmo
+# tempo, e a aceleração deixa de ser mensurável.
+delay_ms = 500
+
 # --- Regras por rota ---------------------------------------------------------
-# Vence o prefixo mais longo. Todos os campos são opcionais: dá para ajustar
-# só o limite, só a janela ou só o cache.
+# Vence o prefixo mais longo. Todos os campos são opcionais: dá para ajustar só
+# o limite, só a janela ou só o cache.
 
 [[routes]]
-path = "/api/v1/busca"
-# Busca é cara no upstream: orçamento maior.
+path = "/api/cardapio"
+# Limite baixo DE PROPÓSITO. O botão "Simular Ataque" dispara 10 requisições
+# nesta rota, e o demonstrador precisa ver a barreira aparecer. Num restaurante
+# de verdade, 8 leituras de cardápio por minuto seriam punitivas — o valor está
+# assim para que o efeito caiba na tela, e isso está dito aqui para ninguém
+# confundir demonstração com recomendação.
+limit = 8
+window_seconds = 60
+
+[[routes]]
+path = "/api/pedido"
+# Escrita: orçamento folgado, porque pedido legítimo não deve ser barrado.
+# Escrita também não é cacheada, e invalida o cache do prefixo — o cardápio em
+# memória deixa de valer quando o pedido muda o estado do restaurante.
 limit = 30
-window_seconds = 10
-
-[[routes]]
-path = "/api/v1/login"
-# Login merece limite bem mais apertado — é a superfície de ataque óbvia.
-limit = 5
-window_seconds = 60
-
-[[routes]]
-path = "/api/v1/admin"
-limit = 60
-window_seconds = 60
-# Rotas administrativas não são cacheadas: o conteúdo muda sem aviso e servir
-# dado velho em tela de admin é pior que não cachear.
-cache = false
-
-[[routes]]
-path = "/api/v1/reports"
-limit = 10
 window_seconds = 60

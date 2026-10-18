@@ -90,25 +90,36 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build da imagem do gateway
-        run: docker build --target runtime -t rust-api-gateway:ci .
+        run: docker build --target runtime -t sushi-tech-gateway:ci .
 
-      - name: Verificar que o binário responde
+      - name: Verificar que o binário responde e serve a demonstração
         run: |
-          docker run -d --name gateway-test -p 8080:8080 rust-api-gateway:ci
-          # O compose sobrepõe a config; aqui usa a que vem na imagem, com o
-          # upstream apontando para porta sem serviço — o /health não depende
-          # do upstream, então deve responder mesmo assim.
+          docker run -d --name gateway-test -p 8080:8080 sushi-tech-gateway:ci
           for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:8080/health > /dev/null; then
               echo "health OK após ${i}s"
-              curl -fsS http://127.0.0.1:8080/health
-              exit 0
+              break
             fi
             sleep 1
           done
-          echo "gateway não respondeu /health em 20s"
-          docker logs gateway-test
-          exit 1
+
+          # A configuração embutida na imagem aponta o upstream para o próprio
+          # gateway, sob `/mock`. Este passo é o que prova que a demonstração é
+          # autocontida: um contêiner sozinho, sem serviço externo, e ainda
+          # assim com dashboard, destino e cache funcionando.
+          curl -fsS http://127.0.0.1:8080/health
+          echo
+          curl -fsS http://127.0.0.1:8080/ | grep -q "Sushi Tech Gateway" \
+            || { echo "dashboard não servido na raiz"; docker logs gateway-test; exit 1; }
+          curl -fsS http://127.0.0.1:8080/mock/health
+          echo
+
+          primeira=$(curl -s -D - -o /dev/null "http://127.0.0.1:8080/api/cardapio?ci=1" | grep -i '^x-cache' | tr -d '\r')
+          segunda=$(curl -s -D - -o /dev/null "http://127.0.0.1:8080/api/cardapio?ci=1" | grep -i '^x-cache' | tr -d '\r')
+          echo "1ª leitura: $primeira"
+          echo "2ª leitura: $segunda"
+          echo "$segunda" | grep -qi "HIT" \
+            || { echo "o cache não entrou em HIT na segunda leitura"; docker logs gateway-test; exit 1; }
 
   compose:
     name: docker compose end-to-end
@@ -127,26 +138,45 @@ jobs:
             sleep 2
           done
 
-      - name: Verificar health e rate limit
+      - name: Verificar dashboard e cache
         run: |
           curl -fsS http://127.0.0.1:8080/health
           echo
-          # /api/v1/login tem limite 5/60s na configuração de exemplo.
-          status=""
-          for i in $(seq 1 8); do
-            status=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/v1/login)
-            echo "requisição $i -> $status"
-          done
-          if [ "$status" != "429" ]; then
-            echo "esperava 429 no fim da sequência, veio $status"
-            docker compose logs
-            exit 1
-          fi
+          curl -fsS http://127.0.0.1:8080/ | grep -q "Sushi Tech Gateway" \
+            || { echo "dashboard não servido"; docker compose logs; exit 1; }
+
+          # Cache: a primeira leitura vai ao destino, a segunda vem da memória.
+          # Feito antes da rajada para que o orçamento ainda esteja livre.
+          primeira=$(curl -s -D - -o /dev/null "http://127.0.0.1:8080/api/cardapio?ci=cache" | grep -i '^x-cache' | tr -d '\r')
+          segunda=$(curl -s -D - -o /dev/null "http://127.0.0.1:8080/api/cardapio?ci=cache" | grep -i '^x-cache' | tr -d '\r')
+          echo "1ª leitura: $primeira"
+          echo "2ª leitura: $segunda"
+          echo "$primeira" | grep -qi "MISS" || { echo "esperava MISS na 1ª leitura"; docker compose logs; exit 1; }
+          echo "$segunda"  | grep -qi "HIT"  || { echo "esperava HIT na 2ª leitura"; docker compose logs; exit 1; }
 
       - name: Verificar headers de rate limit
         run: |
-          curl -sI http://127.0.0.1:8080/api/v1/busca | grep -i "ratelimit\|x-cache" || \
-            { echo "headers ausentes"; docker compose logs; exit 1; }
+          curl -sI "http://127.0.0.1:8080/api/cardapio?ci=headers" \
+            | grep -iE "^(ratelimit|x-cache)" \
+            || { echo "headers de orçamento ausentes"; docker compose logs; exit 1; }
+
+      - name: Verificar que a rajada é barrada
+        run: |
+          # `/api/cardapio` tem limite 8/60s na configuração de demonstração.
+          # As leituras acima já consumiram parte do orçamento, então o que se
+          # verifica é o efeito — houve barreira e houve tráfego — e não um
+          # número exato, que dependeria do que veio antes.
+          passaram=0
+          barradas=0
+          for i in $(seq 1 10); do
+            codigo=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080/api/cardapio?ci=ataque=$i")
+            echo "requisição $i -> $codigo"
+            if [ "$codigo" = "200" ]; then passaram=$((passaram + 1)); fi
+            if [ "$codigo" = "429" ]; then barradas=$((barradas + 1)); fi
+          done
+          echo "passaram=$passaram barradas=$barradas"
+          [ "$barradas" -gt 0 ] || { echo "nenhuma requisição foi barrada"; docker compose logs; exit 1; }
+          [ "$passaram" -gt 0 ] || { echo "nenhuma requisição passou"; docker compose logs; exit 1; }
 
       - name: Encerrar ambiente
         if: always()

@@ -126,21 +126,6 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-/// `GET /` — informação do serviço, para quem chega na raiz sem saber o que é.
-pub async fn index() -> Response {
-    Json(json!({
-        "servico": "rust-api-gateway",
-        "descricao": "API gateway de alto throughput com rate limiting e cache",
-        "endpoints": {
-            "health": "GET /health",
-            "ready": "GET /ready",
-            "metrics": "GET /metrics",
-            "proxy": "ANY /*caminho",
-        },
-    }))
-    .into_response()
-}
-
 /// Erro 404 do router, em JSON.
 pub async fn nao_encontrado() -> Response {
     crate::proxy::erro_para_resposta(&GatewayError::NoRoute("caminho".to_owned()))

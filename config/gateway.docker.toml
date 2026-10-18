@@ -1,18 +1,30 @@
-# Configuração para o ambiente docker-compose.
-# Mesma estrutura de config/gateway.toml, com os hosts trocados pelos nomes dos
-# serviços na rede do compose.
+# =============================================================================
+# Configuração do ambiente docker-compose.
+#
+# Diferença em relação a `config/gateway.toml`: aqui o rate limit usa **Redis**
+# de verdade, no serviço `redis` da rede do compose. É a única config que
+# exercita o orçamento compartilhado entre instâncias — e, portanto, a única
+# que prova que o limite funciona quando há mais de um processo.
+#
+# O upstream continua sendo o próprio gateway: o destino simulado está embutido
+# no binário, então o proxy sai pela rede do contêiner e volta para ele mesmo.
+# =============================================================================
 
 [server]
 bind_addr = "0.0.0.0:8080"
 shutdown_grace_seconds = 10
 
 [upstream]
-url = "http://upstream-fake:9000"
+# A porta é alinhada à escuta real enquanto o simulador estiver ligado; ver a
+# nota em config/gateway.toml.
+url = "http://127.0.0.1:8080/mock"
 timeout_seconds = 30
 connect_timeout_seconds = 5
 
 [rate_limit]
-enabled = false
+enabled = true
+# Redis: o orçamento é compartilhado. É o backend correto atrás de balanceador.
+backend = "redis"
 redis_url = "redis://redis:6379"
 key_prefix = "ratelimit"
 default_limit = 100
@@ -20,12 +32,21 @@ default_window_seconds = 60
 fail_open = true
 
 [cache]
-enabled = false
+enabled = true
 max_capacity = 10000
 ttl_seconds = 30
 cacheable_methods = ["GET", "HEAD"]
 
+[mock]
+enabled = true
+delay_ms = 500
+
 [[routes]]
-path = "/api/v1/login"
-limit = 5
+path = "/api/cardapio"
+limit = 8
+window_seconds = 60
+
+[[routes]]
+path = "/api/pedido"
+limit = 30
 window_seconds = 60

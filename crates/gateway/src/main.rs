@@ -16,8 +16,10 @@ use gateway::proxy::build_client;
 use gateway::state::AppState;
 use gateway::{construir_router, Config};
 use gateway_cache::ResponseCache;
+use gateway_common::RateLimitBackend;
 use gateway_rate_limiter::{MemoryBackend, RedisBackend, SystemClock};
 
+use axum::http::Uri;
 use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -70,11 +72,28 @@ async fn executar() -> Result<(), String> {
 
     tracing::info!(config = %caminho_config, "carregando configuração");
 
-    let config = Config::load(&caminho_config).map_err(|e| format!("configuração: {e}"))?;
+    let mut config = Config::load(&caminho_config).map_err(|e| format!("configuração: {e}"))?;
+
+    // Ordem importa: primeiro o endereço de escuta é resolvido, depois a URL do
+    // destino embutido é alinhada a ele. Um desacordo entre os dois não aparece
+    // como erro de configuração — aparece como conexão recusada em todo o
+    // tráfego proxiado, sem mencionar a causa.
+    let endereco = endereco_de_escuta(
+        config
+            .server
+            .bind_addr
+            .parse()
+            .map_err(|e| format!("bind_addr inválido: {e}"))?,
+    );
+    alinhar_destino_embutido(&mut config, endereco);
+
     tracing::info!(
         upstream = %config.upstream.url,
         rate_limit = config.rate_limit.enabled,
+        rate_limit_backend = ?config.rate_limit.backend,
         cache = config.cache.enabled,
+        mock = config.mock.enabled,
+        escuta = %endereco,
         "configuração carregada"
     );
 
@@ -84,21 +103,31 @@ async fn executar() -> Result<(), String> {
     )
     .map_err(|e| format!("cliente http: {e}"))?;
 
-    let limiter: Arc<dyn gateway_rate_limiter::RateLimiterBackend> = if config.rate_limit.enabled {
-        Arc::new(
-            RedisBackend::connect(&config.rate_limit.redis_url, Arc::new(SystemClock))
-                .await
-                .map_err(|e| {
-                    format!(
-                        "redis indisponível em startup: {} — verifique a URL ou suba `fail_open`",
-                        e.public_message()
-                    )
-                })?,
-        )
-    } else {
-        tracing::warn!("rate limiting desabilitado na configuração");
-        Arc::new(MemoryBackend::new(Arc::new(SystemClock)))
-    };
+    let limiter: Arc<dyn gateway_rate_limiter::RateLimiterBackend> =
+        match (config.rate_limit.enabled, config.rate_limit.backend) {
+            (false, _) => {
+                tracing::warn!("rate limiting desabilitado na configuração");
+                Arc::new(MemoryBackend::new(Arc::new(SystemClock)))
+            }
+            (true, RateLimitBackend::Memory) => {
+                tracing::warn!(
+                    "rate limit em memória: o orçamento vale por processo e não é \
+                     compartilhado — com mais de uma instância, use backend = \"redis\""
+                );
+                Arc::new(MemoryBackend::new(Arc::new(SystemClock)))
+            }
+            (true, RateLimitBackend::Redis) => Arc::new(
+                RedisBackend::connect(&config.rate_limit.redis_url, Arc::new(SystemClock))
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "redis indisponível em startup: {} — verifique a URL, use \
+                             backend = \"memory\" ou suba `fail_open`",
+                            e.public_message()
+                        )
+                    })?,
+            ),
+        };
 
     let cache = ResponseCache::new(
         config.cache.max_capacity,
@@ -111,12 +140,6 @@ async fn executar() -> Result<(), String> {
     if confia_proxy {
         tracing::warn!("GATEWAY_TRUST_PROXY ligado: X-Forwarded-For será considerado");
     }
-
-    let endereco: SocketAddr = config
-        .server
-        .bind_addr
-        .parse()
-        .map_err(|e| format!("bind_addr inválido: {e}"))?;
 
     let estado = AppState::new(config, upstream, limiter, cache, confia_proxy);
     let app = construir_router(estado);
@@ -144,6 +167,80 @@ async fn executar() -> Result<(), String> {
 
     tracing::info!("encerrado");
     Ok(())
+}
+
+/// Resolve o endereço de escuta, dando precedência a `PORT` quando ele existe.
+///
+/// Plataformas como serviço (Render, Fly, Heroku) entregam a porta pela
+/// variável `PORT` e consideram o serviço inacessível se ele escutar em outra.
+/// O arquivo de configuração continua mandando quando `PORT` não existe — que
+/// é o caso local e o do contêiner.
+fn endereco_de_escuta(configurado: SocketAddr) -> SocketAddr {
+    let valor = std::env::var("PORT").ok();
+    match porta_efetiva(configurado.port(), valor.as_deref()) {
+        Some(porta) => {
+            let endereco = SocketAddr::from(([0, 0, 0, 0], porta));
+            tracing::info!(
+                %endereco,
+                configurada = %configurado,
+                "PORT definida pela plataforma: escutando nela"
+            );
+            endereco
+        }
+        None => configurado,
+    }
+}
+
+/// Decide se `PORT` deve substituir a porta configurada.
+///
+/// Separado da leitura do ambiente para poder ser testado: variável de ambiente
+/// é global ao processo, e um teste que dependesse dela seria dependente de
+/// ordem de execução.
+fn porta_efetiva(configurada: u16, porta_do_ambiente: Option<&str>) -> Option<u16> {
+    porta_do_ambiente
+        .and_then(|valor| valor.trim().parse::<u16>().ok())
+        .filter(|porta| *porta != configurada)
+}
+
+/// Reaponta o destino embutido para a porta que está realmente aberta.
+///
+/// Com `[mock] enabled = true` o destino é este mesmo processo — a rota
+/// `/mock/*` mora aqui. Se a plataforma trocou a porta de escuta, a URL do
+/// arquivo apontaria para uma porta fechada e todo o tráfego proxiado falharia.
+/// Só age quando o destino é comprovadamente local: um `upstream` externo não é
+/// tocado, mesmo com o simulador ligado.
+fn alinhar_destino_embutido(config: &mut Config, escuta: SocketAddr) {
+    if !config.mock.enabled {
+        return;
+    }
+
+    let Ok(uri) = config.upstream.url.parse::<Uri>() else {
+        return;
+    };
+    let Some(autoridade) = uri.authority() else {
+        return;
+    };
+
+    let host = autoridade.host();
+    if !eh_destino_local(host) || autoridade.port_u16() == Some(escuta.port()) {
+        return;
+    }
+
+    let novo = format!("http://{host}:{}{}", escuta.port(), uri.path());
+    tracing::warn!(
+        de = %config.upstream.url,
+        para = %novo,
+        "destino embutido reapontado para a porta de escuta"
+    );
+    config.upstream.url = novo;
+}
+
+/// Hosts que apontam para o próprio processo.
+fn eh_destino_local(host: &str) -> bool {
+    matches!(
+        host,
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0"
+    )
 }
 
 /// Prazo de shutdown. Valor fixo porque é um comportamento do processo, não
@@ -201,6 +298,62 @@ mod tests {
     fn estado_grace_e_positivo() {
         let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
         assert!(estado_grace(&addr) > 0);
+    }
+
+    fn config_de_teste(url: &str, mock: bool) -> Config {
+        toml::from_str(&format!(
+            "[upstream]\nurl = \"{url}\"\n\n[mock]\nenabled = {mock}\ndelay_ms = 0\n"
+        ))
+        .expect("config de teste")
+    }
+
+    #[test]
+    fn porta_da_plataforma_tem_precedencia() {
+        assert_eq!(porta_efetiva(8080, Some("10000")), Some(10000));
+        assert_eq!(porta_efetiva(8080, Some(" 10000 ")), Some(10000));
+    }
+
+    #[test]
+    fn sem_porta_ou_igual_a_configurada_a_configuracao_manda() {
+        assert_eq!(porta_efetiva(8080, None), None);
+        assert_eq!(porta_efetiva(8080, Some("8080")), None);
+    }
+
+    #[test]
+    fn porta_da_plataforma_invalida_e_ignorada() {
+        // Um `PORT` malformado não pode derrubar o arranque: vale a configuração.
+        assert_eq!(porta_efetiva(8080, Some("oitenta")), None);
+        assert_eq!(porta_efetiva(8080, Some("")), None);
+        assert_eq!(porta_efetiva(8080, Some("70000")), None);
+        assert_eq!(porta_efetiva(8080, Some("-1")), None);
+    }
+
+    #[test]
+    fn destino_embutido_segue_a_porta_de_escuta() {
+        let mut config = config_de_teste("http://127.0.0.1:8080/mock", true);
+        alinhar_destino_embutido(&mut config, "0.0.0.0:10000".parse().expect("addr"));
+        assert_eq!(config.upstream.url, "http://127.0.0.1:10000/mock");
+    }
+
+    #[test]
+    fn destino_local_sem_porta_explicita_recebe_a_porta_real() {
+        let mut config = config_de_teste("http://localhost/mock", true);
+        alinhar_destino_embutido(&mut config, "0.0.0.0:4321".parse().expect("addr"));
+        assert_eq!(config.upstream.url, "http://localhost:4321/mock");
+    }
+
+    #[test]
+    fn destino_externo_nao_e_tocado() {
+        let mut config = config_de_teste("https://api.exemplo.com/v1", true);
+        alinhar_destino_embutido(&mut config, "0.0.0.0:10000".parse().expect("addr"));
+        assert_eq!(config.upstream.url, "https://api.exemplo.com/v1");
+    }
+
+    #[test]
+    fn com_o_simulador_desligado_o_destino_nao_e_tocado() {
+        let mut config = config_de_teste("http://127.0.0.1:8080/mock", false);
+        alinhar_destino_embutido(&mut config, "0.0.0.0:10000".parse().expect("addr"));
+        assert_eq!(config.upstream.url, "http://127.0.0.1:8080/mock");
     }
 
     #[test]

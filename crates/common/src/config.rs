@@ -23,6 +23,10 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Destino simulado embutido no binário. Existe para que a demonstração
+    /// seja autocontida; em produção o destino é um serviço externo.
+    #[serde(default)]
+    pub mock: MockConfig,
     /// Regras por rota. A regra de prefixo mais longo vence.
     #[serde(default, rename = "routes")]
     pub routes: Vec<RouteRule>,
@@ -75,7 +79,10 @@ impl Default for UpstreamConfig {
 pub struct RateLimitConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// URL do Redis. Necessária quando `enabled = true`.
+    /// Onde o orçamento é guardado.
+    #[serde(default)]
+    pub backend: RateLimitBackend,
+    /// URL do Redis. Necessária quando `backend = "redis"`.
     #[serde(default)]
     pub redis_url: String,
     #[serde(default = "default_key_prefix")]
@@ -84,22 +91,71 @@ pub struct RateLimitConfig {
     pub default_limit: u32,
     #[serde(default = "default_window")]
     pub default_window_seconds: u64,
-    /// Quando o Redis está indisponível: `true` libera o tráfego (disponibilidade
-    /// preferida), `false` bloqueia (proteção preferida). Não existe escolha
-    /// neutra — por isso é explícita na configuração.
+    /// Quando o backend está indisponível: `true` libera o tráfego
+    /// (disponibilidade preferida), `false` bloqueia (proteção preferida).
+    /// Não existe escolha neutra — por isso é explícita na configuração.
     #[serde(default = "default_true")]
     pub fail_open: bool,
+}
+
+/// Onde o orçamento de requisições é mantido.
+///
+/// A escolha é operacional, não estética:
+///
+/// - `Redis` — o orçamento é compartilhado por todas as instâncias. É o único
+///   backend correto quando há mais de um processo atrás de um balanceador:
+///   com orçamento por processo, N instâncias entregam N vezes o limite.
+/// - `Memory` — orçamento por processo, sem serviço externo. Suficiente para
+///   instância única e para demonstração; com mais de uma instância, o limite
+///   efetivo passa a ser `limite × instâncias`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitBackend {
+    #[default]
+    Redis,
+    Memory,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: RateLimitBackend::default(),
             redis_url: String::new(),
             key_prefix: default_key_prefix(),
             default_limit: default_limit(),
             default_window_seconds: default_window(),
             fail_open: default_true(),
+        }
+    }
+}
+
+/// Destino simulado, servido pelo próprio processo sob `/mock/*`.
+///
+/// Não é um mock de teste: é um serviço de verdade, com atraso de rede e de
+/// processamento, que existe para que a demonstração rode em um único
+/// contêiner. O que ele permite observar — cache servindo sem tocar o destino,
+/// limite estourando — é comportamento real do gateway, não do simulador.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MockConfig {
+    /// Liga as rotas `/mock/*`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Atraso que simula o tempo de preparo, em milissegundos.
+    ///
+    /// É o que torna a demonstração de cache observável: sem atraso, resposta
+    /// do cache e resposta do destino levam o mesmo tempo, e a aceleração que
+    /// o cache entrega deixa de ser mensurável.
+    #[serde(default = "default_mock_delay")]
+    pub delay_ms: u64,
+}
+
+impl Default for MockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            delay_ms: default_mock_delay(),
         }
     }
 }
@@ -181,6 +237,9 @@ fn default_cache_ttl() -> u64 {
 fn default_cacheable_methods() -> Vec<String> {
     vec!["GET".to_owned(), "HEAD".to_owned()]
 }
+fn default_mock_delay() -> u64 {
+    500
+}
 
 /// Erros de carga e validação da configuração.
 #[derive(Debug, thiserror::Error)]
@@ -243,9 +302,13 @@ impl Config {
             )));
         }
 
-        if self.rate_limit.enabled && self.rate_limit.redis_url.is_empty() {
+        if self.rate_limit.enabled
+            && self.rate_limit.backend == RateLimitBackend::Redis
+            && self.rate_limit.redis_url.is_empty()
+        {
             return Err(ConfigError::Invalid(
-                "rate_limit.redis_url é obrigatório quando rate_limit.enabled = true".to_owned(),
+                "rate_limit.redis_url é obrigatório quando backend = \"redis\" e enabled = true"
+                    .to_owned(),
             ));
         }
         if self.rate_limit.default_limit == 0 {
@@ -516,5 +579,57 @@ url = "https://api.exemplo.com"
         std::fs::write(&path, base_toml()).expect("write");
         let config = Config::load(&path).expect("deveria carregar");
         assert_eq!(config.rate_limit.default_limit, 42);
+    }
+
+    #[test]
+    fn backend_redis_e_o_padrao_e_exige_url() {
+        let raw = base_toml().replace("redis_url = \"redis://127.0.0.1:6379\"", "redis_url = \"\"");
+        let config: Config = toml::from_str(&raw).expect("parse");
+        assert_eq!(config.rate_limit.backend, RateLimitBackend::Redis);
+        let err = config.validate().expect_err("deveria exigir redis_url");
+        assert!(matches!(err, ConfigError::Invalid(ref m) if m.contains("redis_url")));
+    }
+
+    #[test]
+    fn backend_memory_dispensa_redis() {
+        // É o que permite a demonstração rodar sem serviço externo.
+        let raw = base_toml().replace(
+            "redis_url = \"redis://127.0.0.1:6379\"",
+            "backend = \"memory\"\nredis_url = \"\"",
+        );
+        let config: Config = toml::from_str(&raw).expect("parse");
+        assert_eq!(config.rate_limit.backend, RateLimitBackend::Memory);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn backend_desconhecido_e_rejeitado() {
+        let raw = base_toml().replace(
+            "redis_url = \"redis://127.0.0.1:6379\"",
+            "backend = \"memcached\"\nredis_url = \"x\"",
+        );
+        assert!(toml::from_str::<Config>(&raw).is_err());
+    }
+
+    #[test]
+    fn mock_vem_ligado_com_atraso_de_meio_segundo() {
+        let config: Config = toml::from_str(
+            r#"
+[upstream]
+url = "http://localhost:9000"
+"#,
+        )
+        .expect("parse");
+        assert!(config.mock.enabled);
+        assert_eq!(config.mock.delay_ms, 500);
+    }
+
+    #[test]
+    fn mock_aceita_atraso_e_desligamento() {
+        let raw = format!("{}\n[mock]\nenabled = false\ndelay_ms = 0\n", base_toml());
+        let config: Config = toml::from_str(&raw).expect("parse");
+        assert!(!config.mock.enabled);
+        assert_eq!(config.mock.delay_ms, 0);
+        assert!(config.validate().is_ok());
     }
 }

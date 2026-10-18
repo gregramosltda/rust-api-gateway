@@ -7,14 +7,18 @@
 //! - [`proxy`] — falar com o upstream.
 //! - [`pipeline`] — a ordem das camadas por requisição.
 //! - [`routes`] — endpoints que não são proxy (saúde, métricas).
+//! - [`dashboard`] — a interface visual servida na raiz.
+//! - [`mock`] — o destino simulado sob `/mock/*`.
 
+pub mod dashboard;
+pub mod mock;
 pub mod net;
 pub mod pipeline;
 pub mod proxy;
 pub mod routes;
 pub mod state;
 
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 
 pub use gateway_common::Config;
@@ -22,16 +26,39 @@ pub use state::AppState;
 
 /// Monta o router completo.
 ///
-/// Rotas internas (`/health`, `/ready`, `/metrics`) são registradas **antes**
-/// do fallback `/*caminho`. No Axum a precedência é por registro, então o proxy
-/// curinga precisa vir por último — registrado antes, ele capturaria `/health`
-/// e tentaria encaminhá-lo ao upstream.
+/// Rotas internas (`/health`, `/ready`, `/metrics`, o dashboard) são registradas
+/// **antes** do fallback `/*caminho`. No Axum a precedência é por registro,
+/// então o proxy curinga precisa vir por último — registrado antes, ele
+/// capturaria `/health` e tentaria encaminhá-lo ao upstream.
+///
+/// O destino simulado (`/mock/*`) obedece à mesma regra, por um motivo mais
+/// afiado: o proxy aponta para o próprio gateway (`upstream.url` termina em
+/// `/mock`). Sem uma rota que cubra **todo** o prefixo `/mock`, um caminho não
+/// previsto — `/qualquer-coisa`, por exemplo, que o proxy reescreve para
+/// `/mock/qualquer-coisa` — cairia no curinga outra vez e seria encaminhado
+/// para si mesmo, acrescentando `/mock` a cada volta. Não é um erro de
+/// configuração: é uma única requisição que derruba o processo. A rota
+/// `mock/{*resto}` existe para que o prefixo `/mock` seja sempre resolvido
+/// localmente, e a recursão seja estruturalmente impossível.
 pub fn construir_router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(routes::index))
+    let mock_ligado = state.config.mock.enabled;
+
+    let mut router = Router::new()
+        .route("/", get(dashboard::index))
         .route("/health", get(routes::health))
         .route("/ready", get(routes::ready))
-        .route("/metrics", get(routes::metrics))
+        .route("/metrics", get(routes::metrics));
+
+    if mock_ligado {
+        router = router
+            .route("/mock/health", get(mock::health))
+            .route("/mock/api/cardapio", get(mock::cardapio))
+            .route("/mock/api/pedido", post(mock::pedido))
+            // Fecha o prefixo: ver a nota acima sobre recursão.
+            .route("/mock/{*resto}", any(mock::nao_encontrado));
+    }
+
+    router
         .route("/{*caminho}", any(pipeline::proxy))
         .fallback(routes::nao_encontrado)
         .with_state(state)

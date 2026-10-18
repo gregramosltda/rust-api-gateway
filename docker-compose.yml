@@ -1,39 +1,31 @@
 # =============================================================================
-# Orquestração local: gateway + Redis + upstream falso.
+# Sushi Tech Gateway — ambiente completo.
 #
-# Sobe o ambiente completo com `docker compose up`. O upstream falso existe para
-# que o proxy tenha algo real para encaminhar — sem ele, qualquer teste do
-# caminho de proxy seria contra vácuo.
+# Dois serviços, e o segundo é o único que não poderia ser embutido: o Redis
+# guarda o orçamento de requisições de forma compartilhada. O restaurante
+# simulado mora dentro do binário do gateway (rotas `/mock/*`), então não há um
+# terceiro contêiner para subir antes de ver qualquer coisa.
+#
+#   docker compose up --build
+#   abra http://127.0.0.1:8080
 # =============================================================================
 
-name: rust-api-gateway
+name: sushi-tech-gateway
 
 services:
   redis:
     image: redis:7-alpine
-    # O gateway faz PING no startup; se o Redis ainda não estiver pronto, o
-    # contêiner do gateway morre e o `depends_on` não espera.
+    # O gateway conecta no startup; sem healthcheck, o `depends_on` não espera e
+    # o gateway morre antes de o Redis aceitar conexão.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
       timeout: 2s
       retries: 10
-    # Sem volume: o rate limiter é estado de runtime. Persistir orçamento de
-    # requisições sobrevive a restart, o que faria um gateway reiniciado
-    # continuar barrando clientes que já cumpriram a janela.
+    # Sem volume: orçamento de requisições é estado de runtime. Persistir faria
+    # um gateway reiniciado continuar barrando clientes que já cumpriram a
+    # janela — o limite sobreviveria ao motivo que o justificava.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
-    networks: [gateway-net]
-
-  upstream-fake:
-    build:
-      context: ./upstream
-    environment:
-      PORTA: "9000"
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/health"]
-      interval: 3s
-      timeout: 2s
-      retries: 10
     networks: [gateway-net]
 
   gateway:
@@ -43,18 +35,17 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      upstream-fake:
-        condition: service_healthy
     ports:
-      # Ligado a 127.0.0.1: um gateway exposto na rede sem autenticação é um
+      # Ligado a 127.0.0.1: sem autenticação, um gateway exposto na rede é um
       # proxy aberto para qualquer um que alcance a máquina.
       - "127.0.0.1:8080:8080"
     environment:
       RUST_LOG: "gateway=info,gateway_common=info"
       GATEWAY_LOG_FORMAT: "json"
     volumes:
-      # Configuração específica do compose: os hosts são nomes de serviço da
-      # rede do Docker, não localhost.
+      # Config do compose: o Redis é um nome de serviço da rede do Docker, não
+      # localhost. A config da imagem aponta para um Redis em 127.0.0.1, que
+      # dentro do contêiner não existe.
       - ./config/gateway.docker.toml:/app/config/gateway.toml:ro
     networks: [gateway-net]
 

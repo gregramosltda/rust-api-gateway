@@ -9,7 +9,8 @@ pub mod error;
 pub mod ratelimit;
 
 pub use config::{
-    CacheConfig, Config, ConfigError, RateLimitConfig, RouteRule, ServerConfig, UpstreamConfig,
+    CacheConfig, Config, ConfigError, MockConfig, RateLimitBackend, RateLimitConfig, RouteRule,
+    ServerConfig, UpstreamConfig,
 };
 pub use error::{ErrorBody, ErrorDetail, GatewayError};
 pub use ratelimit::{

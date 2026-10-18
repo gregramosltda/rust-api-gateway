@@ -1,18 +1,32 @@
-# Rust API Gateway & Rate Limiter
+# Sushi Tech Gateway
 
-API gateway de alto throughput em Rust: proxy reverso com **rate limiting
-distribuído por janela deslizante** (Redis) e **cache de respostas em memória**
+**O Maître da sua operação.**
+
+API gateway de alto throughput em Rust: proxy reverso com **rate limiting por
+janela deslizante** (Redis ou em memória) e **cache de respostas em memória**
 (Moka).
 
 Projetado para o caso em que APIs Node/Python degradam sob concorrência: o
 gateway absorve tráfego repetido no cache, corta abuso no rate limiter, e só
-encaminha ao upstream o que é realmente necessário.
+encaminha ao destino o que é realmente necessário.
+
+Este repositório é a **demonstração Sushi Tech**. Um restaurante de sushi é o
+sistema protegido, e o gateway é o maître: conta quantas vezes cada mesa pediu,
+guarda o que já está pronto e barra quem insiste além da conta — antes que a
+cozinha fique sabendo. A demonstração é autocontida: o restaurante simulado
+mora **dentro do próprio binário**, sob `/mock`, então um comando sobe tudo.
+
+```bash
+docker compose up --build
+# abra http://127.0.0.1:8080
+```
 
 ---
 
 ## Sumário
 
 - [Arquitetura](#arquitetura)
+- [A demonstração Sushi Tech](#a-demonstração-sushi-tech)
 - [Por que Axum](#por-que-axum)
 - [Como o rate limiter funciona](#como-o-rate-limiter-funciona)
 - [Decisões de projeto](#decisões-de-projeto)
@@ -37,7 +51,7 @@ graph TD
     C[Cliente] -->|"HTTP"| L[Servidor Axum]
 
     subgraph Pipeline["Pipeline por requisição"]
-        L --> R1{"1. Rate limiter<br/>Redis sliding window"}
+        L --> R1{"1. Rate limiter<br/>janela deslizante"}
         R1 -->|"429 + RateLimit-*"| C
         R1 -->|"permitido"| R2{"2. Cache<br/>Moka TTL"}
         R2 -->|"HIT"| C
@@ -46,7 +60,7 @@ graph TD
         R3 --> R4["4. Proxy"]
     end
 
-    R4 --> U[Upstream]
+    R4 -->|"HTTP, sai pela rede"| U["Destino: /mock<br/>sushi, embutido"]
     R4 -->|"resposta 2xx"| ST["Armazena no cache"]
     ST --> R2
 
@@ -62,10 +76,12 @@ graph TD
     R2 -.-> CFG
 
     subgraph Operação["Endpoints de operação"]
+        D["/<br/>dashboard"]
         H["/health<br/>vivo"]
         RD["/ready<br/>+ dependências"]
         M["/metrics<br/>contadores"]
     end
+    L --> D
     L --> H
     L --> RD
     L --> M
@@ -74,7 +90,19 @@ graph TD
     style R2 fill:#2d5016,color:#fff
     style RED fill:#5f1f1f,color:#fff
     style MOK fill:#1f5f4f,color:#fff
+    style U fill:#5f3a1f,color:#fff
 ```
+
+O destino é o próprio gateway, sob `/mock`. Não é um mock de teste: é um
+servidor HTTP de verdade, alcançado por TCP como qualquer outro — o proxy
+atravessa filtragem de cabeçalhos hop-by-hop, timeout, streaming de corpo. O
+que ele **não** exercita é o que pertence ao ambiente de produção e não ao
+simulador: TLS de saída, autenticação mútua e DNS de um host real.
+
+A alternativa — um segundo contêiner só para o destino — foi descartada porque
+custaria a propriedade mais importante deste repositório: clonar e ver
+funcionando com um comando. Em produção, `[mock] enabled = false` desliga as
+rotas e `upstream.url` recebe o sistema real.
 
 ### Estrutura do workspace
 
@@ -96,6 +124,52 @@ graph LR
     style CA fill:#1f5f3a,color:#fff
     style GW fill:#5f1f3a,color:#fff
 ```
+
+---
+
+## A demonstração Sushi Tech
+
+Abra `http://127.0.0.1:8080`. Não é uma página de exemplo: é o painel do maître,
+servido pelo próprio gateway.
+
+### Os três botões
+
+| Botão | Rota | O que demonstra |
+|---|---|---|
+| **Ver Cardápio** | `GET /api/cardapio` | Clique duas vezes seguidas: a segunda resposta vem do cache e o painel avisa **"Resposta veio do Cache! (Muito rápido!)"**. O tempo cai de ~500 ms para menos de 1 ms, e o contador de idas à cozinha para de subir |
+| **Simular Ataque** | 10 requisições simultâneas a `/api/cardapio` | O maître conta por mesa e por rota. A barra de orçamento esvazia e o excedente volta `429` — a cozinha nunca fica sabendo |
+| **Fazer Pedido** | `POST /api/pedido` | Escrita não é cacheada, e o maître invalida o que guardou para aquele caminho |
+
+### A ordem importa: rate limit antes do cache
+
+Se o cache viesse primeiro, um cliente que apenas relê o mesmo recurso em laço
+nunca consumiria orçamento — e o limitador seria decorativo exatamente contra o
+abuso mais comum, que é a releitura. Com a ordem atual, toda requisição conta,
+venha ela do cache ou não. É também o que faz o botão de ataque funcionar mesmo
+depois de o cardápio já estar em cache.
+
+### Os números, e por que são baixos
+
+Vêm de `config/gateway.toml`. São deliberadamente apertados para que o efeito
+caiba na tela:
+
+| Parâmetro | Valor | Por quê |
+|---|---|---|
+| `/api/cardapio` | 8 req / 60 s | O botão de ataque dispara 10; com 8, a barreira aparece |
+| `/api/pedido` | 30 req / 60 s | Escrita legítima não deve ser barrada |
+| `cache.ttl_seconds` | 30 | Janela confortável para clicar duas vezes |
+| `mock.delay_ms` | 500 | Sem atraso, "veio do cache" não é mensurável |
+
+**Oito leituras de cardápio por minuto seriam punitivas num restaurante real.**
+O valor está assim para que a demonstração seja visível, e está escrito no
+próprio arquivo de configuração para que ninguém confunda demonstração com
+recomendação.
+
+### O navegador não pode esconder o servidor
+
+O painel chama todas as rotas com `cache: "no-store"`. Sem isso, o cache do
+**navegador** responderia antes do gateway, e o `X-Cache: HIT` seria do browser
+— a demonstração passaria a medir a coisa errada.
 
 ---
 
@@ -221,11 +295,21 @@ ignora erro é pior que nenhum teste.
 
 ### Requisitos
 
-- Rust 1.82+ (edition 2021)
-- Redis 7+ (para rate limiting distribuído; opcional em desenvolvimento)
-- Docker (opcional, para o ambiente completo)
+- Docker + Compose — o caminho recomendado
+- Rust 1.82+ (edition 2021) — apenas para rodar fora de contêiner
+- Redis 7+ — opcional: sem ele, use `rate_limit.backend = "memory"`
 
-### Desenvolvimento
+### O caminho curto
+
+```bash
+docker compose up --build
+# painel do maître em http://127.0.0.1:8080
+```
+
+Dois serviços: o `gateway` e o `redis`. O restaurante simulado está embutido no
+binário do gateway, então não há um terceiro contêiner para subir antes.
+
+### Sem contêiner
 
 ```bash
 cargo build --release
@@ -233,24 +317,26 @@ cargo build --release
 ```
 
 ```bash
-# Verificar se está no ar
-curl -s http://127.0.0.1:8080/health | jq
-curl -s http://127.0.0.1:8080/ready  | jq
-
-# Exercitar o proxy
-curl -si http://127.0.0.1:8080/api/v1/usuarios | head -20
+# A demonstração inteira responde sem serviço externo
+curl -s  http://127.0.0.1:8080/health
+curl -si http://127.0.0.1:8080/api/cardapio | grep -i x-cache   # MISS
+curl -si http://127.0.0.1:8080/api/cardapio | grep -i x-cache   # HIT
 ```
 
-### Sem Redis (desenvolvimento)
+### Sem Redis
 
 ```toml
 [rate_limit]
-enabled = false
+enabled = true
+backend = "memory"
 ```
 
-O gateway sobe com o backend em memória. Serve para desenvolvimento e para os
-testes — **não** para produção com múltiplas instâncias, porque o orçamento não
-seria compartilhado entre processos.
+O orçamento passa a valer por processo. É suficiente para desenvolvimento, para
+a demonstração e para implantação de instância única — **não** para produção com
+múltiplas instâncias: com `N` processos, o limite efetivo é `N × limit`, porque
+cada um conta sozinho. É por isso que a escolha do backend é explícita na
+configuração, e não inferida da presença do Redis: a diferença entre "limita" e
+"limita por instância" não pode ser um detalhe silencioso.
 
 ---
 
@@ -266,21 +352,24 @@ Tudo vem de `config/gateway.toml`. Nada de valor fixo no código.
 | `upstream.timeout_seconds` | `30` | Timeout da requisição |
 | `upstream.connect_timeout_seconds` | `5` | Timeout de conexão |
 | `rate_limit.enabled` | `false` | Liga o rate limiting |
-| `rate_limit.redis_url` | — | Obrigatório se `enabled` |
+| `rate_limit.backend` | `"redis"` | `"redis"` (compartilhado) ou `"memory"` (por processo) |
+| `rate_limit.redis_url` | — | Obrigatório se `backend = "redis"` e `enabled` |
 | `rate_limit.default_limit` | `100` | Requisições por janela |
 | `rate_limit.default_window_seconds` | `60` | Tamanho da janela |
-| `rate_limit.fail_open` | `true` | Libera ou bloqueia em falha |
+| `rate_limit.fail_open` | `true` | Libera ou bloqueia em falha do backend |
 | `cache.enabled` | `false` | Liga o cache |
 | `cache.max_capacity` | `10000` | Entradas máximas |
 | `cache.ttl_seconds` | `30` | TTL das entradas |
 | `cache.cacheable_methods` | `["GET","HEAD"]` | Métodos elegíveis |
+| `mock.enabled` | `true` | Liga o destino simulado sob `/mock/*` |
+| `mock.delay_ms` | `500` | Atraso que simula o preparo |
 
 ### Regras por rota
 
 ```toml
 [[routes]]
-path = "/api/v1/login"     # prefixo; vence o mais longo
-limit = 5                   # opcional
+path = "/api/cardapio"      # prefixo; vence o mais longo
+limit = 8                   # opcional
 window_seconds = 60         # opcional
 cache = false               # opcional
 ```
@@ -289,6 +378,7 @@ cache = false               # opcional
 
 | Variável | Efeito |
 |---|---|
+| `PORT` | Porta de escuta; precede `server.bind_addr`. O destino embutido é realinhado junto |
 | `GATEWAY_CONFIG` | Caminho alternativo da configuração |
 | `GATEWAY_LOG_FORMAT=json` | Logs em JSON |
 | `GATEWAY_TRUST_PROXY=1` | Considera `X-Forwarded-For` |
@@ -300,10 +390,25 @@ cache = false               # opcional
 
 | Método | Rota | Descrição |
 |---|---|---|
+| `GET` | `/` | Painel do maître (dashboard da demonstração). |
 | `GET` | `/health` | Vivacidade. **Não** verifica dependências. |
-| `GET` | `/ready` | Prontidão. Verifica Redis. 503 se indisponível. |
+| `GET` | `/ready` | Prontidão. Verifica o backend do rate limiter. 503 se indisponível. |
 | `GET` | `/metrics` | Contadores em JSON. |
-| `*` | `/*caminho` | Proxy para o upstream. |
+| `GET` | `/mock/health` | Saúde do destino simulado. |
+| `GET` | `/mock/api/cardapio` | Cardápio, com o atraso de `mock.delay_ms`. |
+| `POST` | `/mock/api/pedido` | Registra um pedido no destino simulado. |
+| `*` | `/*caminho` | Proxy para o destino, sob `/mock`. |
+
+As rotas `/mock/*` são registradas **antes** do curinga, e a ordem não é
+estética. Como o proxy aponta para o próprio gateway, um `/mock/*` que caísse no
+curinga seria encaminhado para si mesmo — e cada volta acrescentaria outro
+`/mock` ao caminho. Não é hipótese remota: `GET /qualquer-coisa`, que o proxy
+reescreve para `/mock/qualquer-coisa`, bastaria. É por isso que existe uma rota
+`/mock/{*resto}` fechando o prefixo inteiro. Há um teste dedicado a isso
+(`caminho_desconhecido_nao_entra_em_recursao`), porque o modo de falha não é um
+erro: é o processo inteiro consumido por requisições que se chamam sem fim.
+
+Em produção, `[mock] enabled = false` remove todas as rotas `/mock/*`.
 
 ### Por que `/health` e `/ready` são diferentes
 
@@ -370,9 +475,9 @@ cabeçalho.
 Diagnóstico via headers:
 
 ```bash
-curl -si http://localhost:8080/api/v1/usuarios | grep -i x-cache
-# X-Cache: MISS   → veio do upstream
-# X-Cache: HIT    → veio do cache
+curl -si http://localhost:8080/api/cardapio | grep -i x-cache
+# X-Cache: MISS   → o maître foi até a cozinha
+# X-Cache: HIT    → o maître serviu da memória
 ```
 
 ---
@@ -380,19 +485,25 @@ curl -si http://localhost:8080/api/v1/usuarios | grep -i x-cache
 ## Testes
 
 ```bash
-cargo test --workspace              # 171 testes
+cargo test --workspace                     # 202 testes
+cargo test -p gateway --test sushi         # a demonstração Sushi Tech
 cargo test -p gateway --test integration   # pipeline ponta a ponta
 ```
 
+Os testes do `rate-limiter` sobem um Redis real em container (testcontainers):
+**a suíte exige Docker**. Sem Docker eles falham — de propósito, em vez de
+serem pulados em silêncio (ver [Testes contra Redis real](#testes-contra-redis-real-testcontainers)).
+
 | Crate | Testes | Foco |
 |---|---|---|
-| `common` | 34 | Configuração, erros, contratos de rate limit |
+| `common` | 39 | Configuração (incluindo `mock` e `backend`), erros, contratos |
 | `rate-limiter` | 42 | Janela deslizante, concorrência, unicidade de membro |
 | `cache` | 21 | TTL, invalidação, chave, métricas |
-| `gateway` (lib) | 33 | Filtro de headers, montagem de URL, decisões |
-| `gateway` (main) | 3 | Arranque |
-| `gateway` (integração) | 19 | Pipeline completo com upstream real |
-| `rate-limiter` (Redis real) | 19 | Sliding window contra Redis em container |
+| `gateway` (lib) | 39 | Filtro de headers, montagem de URL, decisões |
+| `gateway` (main) | 10 | Arranque e resolução do endereço de escuta |
+| `gateway` (integração) | 19 | Pipeline completo com destino real |
+| `gateway` (sushi) | 13 | Autoproxy, cache, limite e recursão da demonstração |
+| `rate-limiter` (Redis real) | 19 | Janela deslizante contra Redis em container |
 
 ### Cobertura
 
@@ -403,7 +514,7 @@ rustup component add llvm-tools-preview      # pré-requisito do llvm-cov
 cargo llvm-cov --workspace --summary-only
 ```
 
-**90,12% de linhas** (2.389 linhas, 236 não cobertas). Mínimo exigido: 70%.
+**91,06% de linhas** (2.650 linhas, 237 não cobertas). Mínimo exigido: 70%.
 
 | Arquivo | Linhas cobertas | % |
 |---|---:|---:|
@@ -412,19 +523,26 @@ cargo llvm-cov --workspace --summary-only
 | `rate-limiter/src/clock.rs` | 59/59 | 100,00% |
 | `common/src/ratelimit.rs` | 122/122 | 100,00% |
 | `gateway/src/state.rs` | 31/31 | 100,00% |
+| `gateway/src/lib.rs` | 74/74 | 100,00% |
+| `cache/src/lib.rs` | 367/370 | 99,19% |
+| `gateway/src/mock.rs` | 105/106 | 99,06% |
+| `rate-limiter/src/lib.rs` | 171/173 | 98,84% |
 | **`rate-limiter/src/redis_backend.rs`** | **129/131** | **98,47%** |
 | `gateway/src/net.rs` | 152/158 | 96,20% |
+| `gateway/src/dashboard.rs` | 23/24 | 95,83% |
+| `common/src/config.rs` | 345/363 | 95,04% |
 | `gateway/src/proxy.rs` | 228/242 | 94,21% |
 | `common/src/error.rs` | 59/66 | 89,39% |
 | `gateway/src/pipeline.rs` | 137/158 | 86,71% |
-| `gateway/src/routes.rs` | 68/104 | 65,38% |
-| `gateway/src/main.rs` | 16/140 | 11,43% |
+| `gateway/src/routes.rs` | 68/90 | 75,56% |
+| `gateway/src/main.rs` | 82/222 | 36,94% |
 
-`main.rs` aparece baixo porque contém o arranque do binário — carregar
-configuração, montar estado, abrir socket, tratar sinais. Nenhum teste executa
-`main()`; exercitar isso exigiria subir o processo, e o teste de integração já
-faz isso por outro caminho. O número está listado sem ajuste, sem excluir
-arquivos da métrica para inflar o total.
+`main.rs` continua sendo o menor número, por um motivo estrutural: nenhum teste
+executa `main()`. Subir o processo inteiro dentro de um teste é o que os testes
+de integração já fazem por outro caminho. O que dá para testar sem isso —
+`porta_efetiva`, `eh_destino_local`, `alinhar_destino_embutido` — está testado, e
+responde por 36,94% do arquivo; o resto é arranque. O número está listado sem
+ajuste, e nenhum arquivo foi excluído da métrica para inflar o total.
 
 **Nota sobre ferramentas de cobertura.** `cargo-tarpaulin` e `cargo-llvm-cov`
 divergem no que contam como "arquivo": o tarpaulin omitiu `redis_backend.rs` na
@@ -489,6 +607,30 @@ incluindo encaminhamento de headers e status de volta.
 - `requisicoes_concorrentes_respeitam_o_limite` — 60 concorrentes, exatamente o limite passa
 - `upstream_inacessivel_devolve_502` — degradação sem panic
 
+### O que os testes da demonstração provam
+
+O destino de teste **é o próprio gateway**, num endereço efêmero: o proxy sai
+por TCP e volta, como em produção. A porta precisa existir antes da
+configuração — daí o `bind` acontecer primeiro e a URL do destino ser montada
+depois.
+
+- `segundo_clique_vem_do_cache_e_nao_toca_o_destino` — `MISS` e depois `HIT`,
+  com os corpos idênticos byte a byte. Uma terceira chamada, com outra chave de
+  cache, prova que o contador do destino sabe avançar — sem esse passo, um cache
+  que nunca existisse também "passaria"
+- `caminho_desconhecido_nao_entra_em_recursao` — o limite de tempo é a asserção:
+  não travar é o requisito
+- `rajada_e_barrada_pelo_limite_da_rota` — 5 requisições com limite 3: passam
+  exatamente 3, e as barradas trazem `Retry-After`
+- `resposta_liberada_traz_o_orcamento_restante` — os headers de orçamento batem
+- `atraso_do_preparo_e_aplicado` — se o atraso sumir, a demonstração de cache
+  continua "passando" e deixa de provar qualquer coisa
+- `escrita_barrada_nao_chega_ao_destino` — escrita consome orçamento sem a
+  contrapartida do cache
+
+A prova do cache é o **contador do destino**, e não o tempo: medir tempo em
+teste é flaky sob carga, e o contador entrega a mesma informação de forma exata.
+
 ---
 
 ## Benchmark
@@ -525,7 +667,7 @@ fazer Redis no caminho crítico não prejudica o throughput.
 ### Imagem multi-stage
 
 ```bash
-docker build --target runtime -t rust-api-gateway .
+docker build --target runtime -t sushi-tech-gateway .
 ```
 
 A imagem final não tem toolchain nem código-fonte. Não é estética: uma imagem de
@@ -538,12 +680,22 @@ usuário não é root.
 docker compose up --build
 ```
 
-Sobe três serviços: `gateway`, `redis` e `upstream-fake`. O upstream falso
-existe porque sem ele qualquer teste do caminho de proxy seria contra vácuo.
+Dois serviços:
+
+| Serviço | Papel |
+|---|---|
+| `gateway` | O maître: painel, destino simulado (`/mock`) e pipeline |
+| `redis` | Orçamento de requisições compartilhado (`backend = "redis"`) |
+
+O destino simulado mora **dentro** do contêiner do gateway, então
+`docker compose up` sobe a demonstração inteira sem um terceiro serviço. A
+configuração usada é `config/gateway.docker.toml`, montada sobre a da imagem —
+lá o Redis é um nome de serviço da rede do Docker, e não `127.0.0.1`.
 
 ```bash
-curl -s http://127.0.0.1:8080/ready | jq
-curl -si http://127.0.0.1:8080/api/v1/login | grep -i ratelimit
+curl -s  http://127.0.0.1:8080/ready
+curl -si http://127.0.0.1:8080/api/cardapio | grep -i x-cache   # MISS
+curl -si http://127.0.0.1:8080/api/cardapio | grep -i x-cache   # HIT
 docker compose down -v
 ```
 
@@ -556,17 +708,41 @@ docker compose down -v
 | Job | O que faz |
 |---|---|
 | `qualidade` | fmt, clippy `-D warnings`, testes, build release |
-| `cobertura` | tarpaulin com `--fail-under-lines 70` |
-| `docker` | build da imagem e verificação de `/health` |
-| `compose` | `docker compose up` e verificação de rate limit real |
+| `cobertura` | llvm-cov com limiares (global ≥ 85%, `redis_backend.rs` ≥ 70%) |
+| `docker` | build da imagem; sobe **um** contêiner e verifica painel, destino e `X-Cache: HIT` |
+| `compose` | `docker compose up`; verifica painel, `MISS` → `HIT` e que a rajada é barrada |
+
+O job `docker` existe para travar a propriedade central do projeto: **um
+contêiner sozinho serve a demonstração inteira**. Se alguém reintroduzir a
+dependência de um serviço externo, ele quebra.
 
 ---
 
 ## Limitações conhecidas
 
-**Rate limiter em memória não é compartilhado.** Com `rate_limit.enabled = false`
-e múltiplas instâncias, cada uma dá orçamento dobrado. Em produção, Redis é
+**Rate limiter em memória não é compartilhado.** Com `backend = "memory"` e
+múltiplas instâncias, cada processo conta sozinho e o limite efetivo passa a ser
+`N × limit`. Em produção com mais de uma instância, `backend = "redis"` é
 obrigatório.
+
+**O destino simulado é alcançável por fora.** `GET /mock/api/cardapio` responde
+a qualquer cliente e **não** passa pelo rate limiter — é um artefato da
+demonstração. Em produção as rotas `/mock/*` ficam desligadas
+(`[mock] enabled = false`); aqui elas existem para que o painel pergunte pela
+saúde da "cozinha" sem passar pelo pipeline.
+
+**O proxy aponta para o próprio gateway.** Com o simulador ligado, a requisição
+sai pela pilha TCP e volta ao mesmo processo: há uma indireção de loopback que
+não existiria falando com um host externo. A porta do destino é sempre alinhada
+à porta de escuta real — que vem de `PORT` quando a plataforma a define, e de
+`server.bind_addr` caso contrário — então as duas não podem discordar. O custo
+de latência do loopback é o preço de uma demonstração que sobe com um comando
+só.
+
+**O painel usa Tailwind via CDN.** Compilar CSS adicionaria uma dependência de
+Node a um projeto que não tem nenhuma, para servir uma página estática. Sem o
+CDN a página perde o acabamento e continua legível, porque há um bloco de estilo
+mínimo embutido. Em produção, o caminho seria compilar o CSS no build.
 
 **Invalidação do cache é por varredura.** Não há remoção nativa por padrão de
 chave no Moka, então `invalidate_prefix` percorre as entradas. É aceitável
