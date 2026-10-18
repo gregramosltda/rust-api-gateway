@@ -699,6 +699,24 @@ curl -si http://127.0.0.1:8080/api/cardapio | grep -i x-cache   # HIT
 docker compose down -v
 ```
 
+### Implantação (PaaS)
+
+A imagem roda em Render, Fly ou Heroku sem alteração: `PORT` tem precedência
+sobre `server.bind_addr` e o destino embutido é realinhado junto. Como a
+configuração embutida usa `rate_limit.backend = "memory"`, a demonstração
+funciona **sem Redis** — com o limite valendo por instância.
+
+Atrás de proxy ou balanceador, uma variável merece atenção:
+
+| Variável | Por quê |
+|---|---|
+| `GATEWAY_TRUST_PROXY=1` | Sem ela, todo o tráfego chega com o IP do balanceador e **todos os visitantes dividem o mesmo orçamento**: um visitante sozinho esgotaria o limite do site inteiro pelos 60 s seguintes |
+
+Ligue essa variável apenas atrás de um proxy que **reescreva** o
+`X-Forwarded-For`. Se ele apenas *anexa* o IP à cadeia que o cliente enviou, o
+primeiro elemento é escolhido pelo atacante — e aí o limite deixa de valer,
+porque cada requisição pode se declarar de um IP diferente.
+
 ---
 
 ## CI
