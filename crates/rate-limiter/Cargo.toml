@@ -1,0 +1,26 @@
+[package]
+name = "gateway-rate-limiter"
+description = "Rate limiting por sliding window distribuído sobre Redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+gateway-common = { workspace = true }
+
+redis = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+# Redis real em container efêmero. Mock não serviria: o código sob teste é o
+# script Lua, a serialização dos argumentos e o round-trip de rede — nada disso
+# existe num mock, e um mock validaria a si mesmo.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["redis"] }

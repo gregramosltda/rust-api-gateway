@@ -1,0 +1,63 @@
+# =============================================================================
+# Orquestração local: gateway + Redis + upstream falso.
+#
+# Sobe o ambiente completo com `docker compose up`. O upstream falso existe para
+# que o proxy tenha algo real para encaminhar — sem ele, qualquer teste do
+# caminho de proxy seria contra vácuo.
+# =============================================================================
+
+name: rust-api-gateway
+
+services:
+  redis:
+    image: redis:7-alpine
+    # O gateway faz PING no startup; se o Redis ainda não estiver pronto, o
+    # contêiner do gateway morre e o `depends_on` não espera.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    # Sem volume: o rate limiter é estado de runtime. Persistir orçamento de
+    # requisições sobrevive a restart, o que faria um gateway reiniciado
+    # continuar barrando clientes que já cumpriram a janela.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [gateway-net]
+
+  upstream-fake:
+    build:
+      context: ./upstream
+    environment:
+      PORTA: "9000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    networks: [gateway-net]
+
+  gateway:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      redis:
+        condition: service_healthy
+      upstream-fake:
+        condition: service_healthy
+    ports:
+      # Ligado a 127.0.0.1: um gateway exposto na rede sem autenticação é um
+      # proxy aberto para qualquer um que alcance a máquina.
+      - "127.0.0.1:8080:8080"
+    environment:
+      RUST_LOG: "gateway=info,gateway_common=info"
+      GATEWAY_LOG_FORMAT: "json"
+    volumes:
+      # Configuração específica do compose: os hosts são nomes de serviço da
+      # rede do Docker, não localhost.
+      - ./config/gateway.docker.toml:/app/config/gateway.toml:ro
+    networks: [gateway-net]
+
+networks:
+  gateway-net:
+    driver: bridge

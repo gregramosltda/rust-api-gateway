@@ -1,0 +1,67 @@
+# =============================================================================
+# Configuração do gateway.
+#
+# Nada aqui é padrão hardcoded no código: o binário lê este arquivo. Valores
+# ausentes usam o padrão do struct `Config`, que está documentado em
+# `crates/common/src/config.rs`.
+#
+# Ao subir:  ./gateway config/gateway.toml
+# =============================================================================
+
+[server]
+# 127.0.0.1 por padrão: exposição em rede precisa ser decisão explícita.
+# Para uso em container ou atrás de proxy, troque por "0.0.0.0:8080".
+bind_addr = "127.0.0.1:8080"
+shutdown_grace_seconds = 10
+
+[upstream]
+url = "http://127.0.0.1:9000"
+timeout_seconds = 30
+connect_timeout_seconds = 5
+
+[rate_limit]
+enabled = true
+redis_url = "redis://127.0.0.1:6379"
+key_prefix = "ratelimit"
+default_limit = 100
+default_window_seconds = 60
+# `true`: Redis fora do ar libera o tráfego (prioriza disponibilidade).
+# `false`: bloqueia (prioriza proteção). Não existe escolha neutra.
+fail_open = true
+
+[cache]
+enabled = true
+max_capacity = 10000
+ttl_seconds = 30
+# Só verbos seguros. Um POST cacheado devolveria a resposta da escrita para
+# leituras seguintes — o oposto do esperado.
+cacheable_methods = ["GET", "HEAD"]
+
+# --- Regras por rota ---------------------------------------------------------
+# Vence o prefixo mais longo. Todos os campos são opcionais: dá para ajustar
+# só o limite, só a janela ou só o cache.
+
+[[routes]]
+path = "/api/v1/busca"
+# Busca é cara no upstream: orçamento maior.
+limit = 30
+window_seconds = 10
+
+[[routes]]
+path = "/api/v1/login"
+# Login merece limite bem mais apertado — é a superfície de ataque óbvia.
+limit = 5
+window_seconds = 60
+
+[[routes]]
+path = "/api/v1/admin"
+limit = 60
+window_seconds = 60
+# Rotas administrativas não são cacheadas: o conteúdo muda sem aviso e servir
+# dado velho em tela de admin é pior que não cachear.
+cache = false
+
+[[routes]]
+path = "/api/v1/reports"
+limit = 10
+window_seconds = 60

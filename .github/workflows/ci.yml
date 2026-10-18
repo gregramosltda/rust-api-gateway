@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  qualidade:
+    name: Build, test, clippy, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar toolchain Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache de build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verificar formatação
+        run: cargo fmt --all --check
+
+      - name: Clippy com warnings negados
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Testes
+        # Os testes do rate-limiter sobem um Redis em container via
+        # testcontainers. O runner do GitHub tem Docker, então rodam aqui
+        # como qualquer outro teste.
+        run: cargo test --workspace --all-features
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+  cobertura:
+    name: Cobertura (mínimo 70%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Medir cobertura
+        run: cargo llvm-cov --workspace --summary-only | tee cobertura.txt
+
+      - name: Verificar limiares de cobertura
+        # Falha se a cobertura global cair abaixo de 85% ou se o
+        # redis_backend.rs ficar abaixo de 70% — que é onde o rate limiter
+        # realmente executa.
+        run: |
+          # Campo 10 é "Lines / Cover" no resumo do llvm-cov.
+          # Colunas: 1 nome · 2 regions · 3 missed · 4 cover% · 5 funcs ·
+          #          6 missed · 7 cover% · 8 lines · 9 missed · 10 cover%
+          GLOBAL=$(grep TOTAL cobertura.txt | awk '{print $10}')
+          REDIS=$(grep 'redis_backend.rs' cobertura.txt | awk '{print $10}')
+          echo "cobertura global:    $GLOBAL"
+          echo "cobertura redis:      $REDIS"
+          GLOBAL_SEM=$(echo "$GLOBAL" | tr -d '%')
+          REDIS_SEM=$(echo "$REDIS" | tr -d '%')
+          awk -v v="$GLOBAL_SEM" 'BEGIN { exit (v < 85.0) }' || {
+            echo "cobertura global $GLOBAL abaixo do mínimo de 85%"; exit 1; }
+          awk -v v="$REDIS_SEM" 'BEGIN { exit (v < 70.0) }' || {
+            echo "cobertura redis_backend.rs $REDIS abaixo do mínimo de 70%"; exit 1; }
+
+      - name: Publicar relatório
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobertura
+          path: cobertura.txt
+
+  docker:
+    name: Build da imagem
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build da imagem do gateway
+        run: docker build --target runtime -t rust-api-gateway:ci .
+
+      - name: Verificar que o binário responde
+        run: |
+          docker run -d --name gateway-test -p 8080:8080 rust-api-gateway:ci
+          # O compose sobrepõe a config; aqui usa a que vem na imagem, com o
+          # upstream apontando para porta sem serviço — o /health não depende
+          # do upstream, então deve responder mesmo assim.
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8080/health > /dev/null; then
+              echo "health OK após ${i}s"
+              curl -fsS http://127.0.0.1:8080/health
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "gateway não respondeu /health em 20s"
+          docker logs gateway-test
+          exit 1
+
+  compose:
+    name: docker compose end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Subir o ambiente completo
+        run: |
+          docker compose up -d --build
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/ready > /dev/null; then
+              echo "pronto após ${i}s"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Verificar health e rate limit
+        run: |
+          curl -fsS http://127.0.0.1:8080/health
+          echo
+          # /api/v1/login tem limite 5/60s na configuração de exemplo.
+          status=""
+          for i in $(seq 1 8); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/api/v1/login)
+            echo "requisição $i -> $status"
+          done
+          if [ "$status" != "429" ]; then
+            echo "esperava 429 no fim da sequência, veio $status"
+            docker compose logs
+            exit 1
+          fi
+
+      - name: Verificar headers de rate limit
+        run: |
+          curl -sI http://127.0.0.1:8080/api/v1/busca | grep -i "ratelimit\|x-cache" || \
+            { echo "headers ausentes"; docker compose logs; exit 1; }
+
+      - name: Encerrar ambiente
+        if: always()
+        run: docker compose down -v

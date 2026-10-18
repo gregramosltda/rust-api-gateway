@@ -1,0 +1,28 @@
+# Build
+/target/
+**/*.rs.bk
+*.pdb
+
+# Configuração com credenciais
+.env
+.env.*
+!.env.example
+
+# Coverage
+cobertura.xml
+cobertura.txt
+*.lcov
+tarpaulin-report.html
+
+# Criterion — o histórico local serve para comparar execuções na mesma máquina;
+# não pertence ao repositório.
+criterion/
+
+# Editores
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Runtime
+*.log

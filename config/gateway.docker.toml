@@ -1,0 +1,31 @@
+# Configuração para o ambiente docker-compose.
+# Mesma estrutura de config/gateway.toml, com os hosts trocados pelos nomes dos
+# serviços na rede do compose.
+
+[server]
+bind_addr = "0.0.0.0:8080"
+shutdown_grace_seconds = 10
+
+[upstream]
+url = "http://upstream-fake:9000"
+timeout_seconds = 30
+connect_timeout_seconds = 5
+
+[rate_limit]
+enabled = true
+redis_url = "redis://redis:6379"
+key_prefix = "ratelimit"
+default_limit = 100
+default_window_seconds = 60
+fail_open = true
+
+[cache]
+enabled = true
+max_capacity = 10000
+ttl_seconds = 30
+cacheable_methods = ["GET", "HEAD"]
+
+[[routes]]
+path = "/api/v1/login"
+limit = 5
+window_seconds = 60
