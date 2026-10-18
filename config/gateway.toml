@@ -11,7 +11,7 @@
 [server]
 # 127.0.0.1 por padrão: exposição em rede precisa ser decisão explícita.
 # Para uso em container ou atrás de proxy, troque por "0.0.0.0:8080".
-bind_addr = "127.0.0.1:8080"
+bind_addr = "0.0.0.0:8080"
 shutdown_grace_seconds = 10
 
 [upstream]
