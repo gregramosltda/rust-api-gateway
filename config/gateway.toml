@@ -20,7 +20,7 @@ timeout_seconds = 30
 connect_timeout_seconds = 5
 
 [rate_limit]
-enabled = true
+enabled = false
 redis_url = "redis://127.0.0.1:6379"
 key_prefix = "ratelimit"
 default_limit = 100
@@ -30,7 +30,7 @@ default_window_seconds = 60
 fail_open = true
 
 [cache]
-enabled = true
+enabled = false
 max_capacity = 10000
 ttl_seconds = 30
 # Só verbos seguros. Um POST cacheado devolveria a resposta da escrita para
