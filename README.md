@@ -834,6 +834,7 @@ Os relatórios de execução ficam em [`docs/`](docs/):
 | [`RELATORIO_OS-PORT-001.md`](docs/RELATORIO_OS-PORT-001.md) | Construção e validação do gateway |
 | [`RELATORIO_OS-PORT-001-FIX.md`](docs/RELATORIO_OS-PORT-001-FIX.md) | Cobertura do backend Redis contra servidor real |
 | [`RELATORIO_OS-PORT-001-FIX2.md`](docs/RELATORIO_OS-PORT-001-FIX2.md) | Identificação do cliente atrás de proxy |
+| [`RELATORIO_OS-PORT-001-FIX3.md`](docs/RELATORIO_OS-PORT-001-FIX3.md) | Alinhamento do doc do pipeline ao código |
 
 ---
 

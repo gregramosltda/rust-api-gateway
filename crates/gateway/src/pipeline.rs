@@ -1,12 +1,20 @@
-//! Pipeline de requisição: cache → rate limit → proxy → cache.
+//! Pipeline de requisição: rate limit → cache → invalidação → proxy → cache.
 //!
 //! A ordem das etapas não é arbitrária.
 //!
-//! **Cache antes do rate limit** de propósito. Se o rate limit vier primeiro,
-//! cada requisição repetida de um recurso caro consome orçamento, e um cliente
-//! que só lê o mesmo recurso em loop seria barrado mesmo sem gerar carga no
-//! upstream. Servindo do cache não gera tráfego, então não deve custar
-//! orçamento.
+//! **Rate limit antes do cache** de propósito. Uma requisição barrada (429) é
+//! recusada antes de o cache sequer ser consultado: ela não lê, não escreve e
+//! não consome recurso algum. A ordem oposta — cache primeiro — parece mais
+//! eficiente, porque uma leitura repetida não gastaria orçamento nem chegaria
+//! ao upstream. Mas isso esvazia o limite: um cliente que só lê o mesmo recurso
+//! em loop, que é exatamente o abuso que o rate limiter existe para conter,
+//! seria servido do cache e nunca contaria. E o recurso em cache é justamente o
+//! quente, o mais visado.
+//!
+//! O preço dessa escolha é conhecido e aceito: uma leitura repetida gasta
+//! orçamento mesmo sendo servida do cache. O cache continua economizando carga
+//! do upstream; o orçamento continua contando todas as requisições. Um limite
+//! que sempre vale é melhor que um limite que só vale quando a resposta é cara.
 //!
 //! **Invalidação antes de encaminhar escrita.** Um `POST` bem-sucedido que não
 //! invalida o cache deixa a resposta antiga servida até o TTL expirar — o
