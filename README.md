@@ -275,11 +275,17 @@ Quando o Redis está fora do ar, há duas escolhas legítimas:
 Não existe escolha neutra, então está explícita na configuração em vez de
 implícita num default.
 
-### `X-Forwarded-For` só com opt-in
+### Cabeçalho de IP só com opt-in
 
-`GATEWAY_TRUST_PROXY` precisa estar ligado para que o header seja considerado.
-Sem essa trava, qualquer cliente escreveria `X-Forwarded-For: 1.2.3.4` e burlaria
-o rate limit, escolhendo o próprio IP a cada requisição.
+`GATEWAY_TRUST_PROXY` precisa estar ligado para que qualquer cabeçalho de IP
+seja considerado. Sem essa trava, qualquer cliente escreveria
+`X-Forwarded-For: 1.2.3.4` (ou `CF-Connecting-IP: 1.2.3.4`) e burlaria o rate
+limit, escolhendo o próprio IP a cada requisição.
+
+Com a trava ligada, a ordem é `CF-Connecting-IP` → `X-Forwarded-For` →
+`X-Real-IP` → IP da conexão. O `CF-Connecting-IP` vem primeiro porque a borda da
+Cloudflare o **reescreve** — o cliente não consegue escolhê-lo, ao contrário de
+um `X-Forwarded-For` que ele pode prefixar.
 
 ### Zero `unwrap()` e zero `panic!` em produção
 
@@ -381,7 +387,7 @@ cache = false               # opcional
 | `PORT` | Porta de escuta; precede `server.bind_addr`. O destino embutido é realinhado junto |
 | `GATEWAY_CONFIG` | Caminho alternativo da configuração |
 | `GATEWAY_LOG_FORMAT=json` | Logs em JSON |
-| `GATEWAY_TRUST_PROXY=1` | Considera `X-Forwarded-For` |
+| `GATEWAY_TRUST_PROXY=1` | Considera `CF-Connecting-IP`, `X-Forwarded-For` e `X-Real-IP` |
 | `RUST_LOG` | Filtro de log (`gateway=debug`) |
 
 ---
@@ -455,9 +461,11 @@ reconhecem o clássico.
 
 ### Identificação do cliente
 
-Por padrão, o IP do socket. Com `GATEWAY_TRUST_PROXY=1`, o primeiro salto do
-`X-Forwarded-For` tem precedência — apenas atrás de um proxy que reescreva o
-cabeçalho.
+Por padrão, o IP do socket e nenhum cabeçalho. Com `GATEWAY_TRUST_PROXY=1`, a
+ordem passa a ser `CF-Connecting-IP` → `X-Forwarded-For` (primeiro salto) →
+`X-Real-IP` → socket — sempre atrás de um proxy que reescreva esses cabeçalhos.
+O porquê da ordem e o risco do cabeçalho forjado estão em
+[Deploy no Render](#deploy-no-render).
 
 ---
 
@@ -485,7 +493,7 @@ curl -si http://localhost:8080/api/cardapio | grep -i x-cache
 ## Testes
 
 ```bash
-cargo test --workspace                     # 202 testes
+cargo test --workspace                     # 213 testes
 cargo test -p gateway --test sushi         # a demonstração Sushi Tech
 cargo test -p gateway --test integration   # pipeline ponta a ponta
 ```
@@ -499,9 +507,9 @@ serem pulados em silêncio (ver [Testes contra Redis real](#testes-contra-redis-
 | `common` | 39 | Configuração (incluindo `mock` e `backend`), erros, contratos |
 | `rate-limiter` | 42 | Janela deslizante, concorrência, unicidade de membro |
 | `cache` | 21 | TTL, invalidação, chave, métricas |
-| `gateway` (lib) | 39 | Filtro de headers, montagem de URL, decisões |
+| `gateway` (lib) | 48 | Identificação do cliente, filtro de headers, montagem de URL |
 | `gateway` (main) | 10 | Arranque e resolução do endereço de escuta |
-| `gateway` (integração) | 19 | Pipeline completo com destino real |
+| `gateway` (integração) | 21 | Pipeline completo com destino real |
 | `gateway` (sushi) | 13 | Autoproxy, cache, limite e recursão da demonstração |
 | `rate-limiter` (Redis real) | 19 | Janela deslizante contra Redis em container |
 
@@ -514,7 +522,7 @@ rustup component add llvm-tools-preview      # pré-requisito do llvm-cov
 cargo llvm-cov --workspace --summary-only
 ```
 
-**91,06% de linhas** (2.650 linhas, 237 não cobertas). Mínimo exigido: 70%.
+**91,29% de linhas** (2.699 linhas, 235 não cobertas). Mínimo exigido: 70%.
 
 | Arquivo | Linhas cobertas | % |
 |---|---:|---:|
@@ -528,7 +536,7 @@ cargo llvm-cov --workspace --summary-only
 | `gateway/src/mock.rs` | 105/106 | 99,06% |
 | `rate-limiter/src/lib.rs` | 171/173 | 98,84% |
 | **`rate-limiter/src/redis_backend.rs`** | **129/131** | **98,47%** |
-| `gateway/src/net.rs` | 152/158 | 96,20% |
+| `gateway/src/net.rs` | 203/207 | 98,07% |
 | `gateway/src/dashboard.rs` | 23/24 | 95,83% |
 | `common/src/config.rs` | 345/363 | 95,04% |
 | `gateway/src/proxy.rs` | 228/242 | 94,21% |
@@ -699,23 +707,56 @@ curl -si http://127.0.0.1:8080/api/cardapio | grep -i x-cache   # HIT
 docker compose down -v
 ```
 
-### Implantação (PaaS)
+### Deploy no Render
 
-A imagem roda em Render, Fly ou Heroku sem alteração: `PORT` tem precedência
-sobre `server.bind_addr` e o destino embutido é realinhado junto. Como a
-configuração embutida usa `rate_limit.backend = "memory"`, a demonstração
-funciona **sem Redis** — com o limite valendo por instância.
+A imagem roda sem alteração: `PORT` tem precedência sobre `server.bind_addr` e o
+destino embutido é realinhado junto. Como a configuração embutida usa
+`rate_limit.backend = "memory"`, a demonstração funciona **sem Redis** — com o
+limite valendo por instância.
 
-Atrás de proxy ou balanceador, uma variável merece atenção:
+**Uma variável é obrigatória lá, e não é óbvia:**
 
 | Variável | Por quê |
 |---|---|
 | `GATEWAY_TRUST_PROXY=1` | Sem ela, todo o tráfego chega com o IP do balanceador e **todos os visitantes dividem o mesmo orçamento**: um visitante sozinho esgotaria o limite do site inteiro pelos 60 s seguintes |
 
-Ligue essa variável apenas atrás de um proxy que **reescreva** o
-`X-Forwarded-For`. Se ele apenas *anexa* o IP à cadeia que o cliente enviou, o
-primeiro elemento é escolhido pelo atacante — e aí o limite deixa de valer,
-porque cada requisição pode se declarar de um IP diferente.
+#### De onde vem o IP do visitante
+
+O Render serve a aplicação atrás da borda da Cloudflare. Com a variável ligada,
+o gateway procura o visitante nesta ordem:
+
+| # | Cabeçalho | Por que nesta posição |
+|---|---|---|
+| 1 | `CF-Connecting-IP` | A borda **reescreve** este valor; o cliente não o escolhe |
+| 2 | `X-Forwarded-For` | Cadeia que o cliente pode prefixar — só vale se o proxy a reescrever |
+| 3 | `X-Real-IP` | Alternativa de alguns proxies |
+| 4 | IP da conexão | O último recurso, sempre disponível |
+
+O primeiro critério disponível é o que forma a chave do orçamento: sem
+`CF-Connecting-IP`, um visitante poderia mandar um `X-Forwarded-For` diferente a
+cada requisição e nunca esgotar o limite.
+
+#### O risco do cabeçalho forjado
+
+`X-Forwarded-For` é escrito pelo cliente e **não** é confiável por si só. Se o
+proxy apenas *anexa* o IP do visitante à cadeia que já veio, o primeiro elemento
+é escolhido pelo atacante — e aí cada requisição pode se declarar de um IP
+diferente, anulando o rate limit.
+
+É por isso que a variável é uma escolha explícita e o padrão é não confiar:
+`GATEWAY_TRUST_PROXY` desligada ignora todos os cabeçalhos e usa o IP da conexão.
+Ligue-a **apenas** atrás de um proxy que reescreva os cabeçalhos — nunca em um
+serviço exposto direto.
+
+#### Como confirmar em produção
+
+Depois do deploy, exercite o limite de dois IPs reais (um deles por rede móvel)
+e confirme que cada um tem orçamento próprio:
+
+```bash
+# Repita até ver 429: um IP esgota, o outro continua sendo atendido
+curl -si https://SEU-SERVICO.onrender.com/api/cardapio | grep -i ratelimit-remaining
+```
 
 ---
 
@@ -781,6 +822,18 @@ requer um parser no coletor.
 **Membro único por instância + contador.** Correto para até 2⁶⁴ requisições por
 instância por milissegundo. Suficiente para qualquer caso real, mas não é
 infinito.
+
+---
+
+## Documentação
+
+Os relatórios de execução ficam em [`docs/`](docs/):
+
+| Relatório | Escopo |
+|---|---|
+| [`RELATORIO_OS-PORT-001.md`](docs/RELATORIO_OS-PORT-001.md) | Construção e validação do gateway |
+| [`RELATORIO_OS-PORT-001-FIX.md`](docs/RELATORIO_OS-PORT-001-FIX.md) | Cobertura do backend Redis contra servidor real |
+| [`RELATORIO_OS-PORT-001-FIX2.md`](docs/RELATORIO_OS-PORT-001-FIX2.md) | Identificação do cliente atrás de proxy |
 
 ---
 

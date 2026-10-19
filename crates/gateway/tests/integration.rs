@@ -134,11 +134,25 @@ struct Harness {
 
 impl Harness {
     async fn subir(config: Config, clock: Arc<ManualClock>) -> Self {
+        Self::subir_com(config, clock, false).await
+    }
+
+    /// Igual a `subir`, mas confiando nos cabeçalhos de proxy — o modo de
+    /// produção atrás de balanceador.
+    ///
+    /// Existe porque, sem ele, `confia_proxy` é sempre falso e nenhum teste
+    /// provaria que o cabeçalho chega até a **chave** do rate limiter. Provar a
+    /// extração em unidade não prova o uso.
+    async fn subir_confiando_no_proxy(config: Config, clock: Arc<ManualClock>) -> Self {
+        Self::subir_com(config, clock, true).await
+    }
+
+    async fn subir_com(config: Config, clock: Arc<ManualClock>, confia_proxy: bool) -> Self {
         let upstream_client =
             build_client(Duration::from_secs(2), Duration::from_secs(5)).expect("cliente upstream");
         let limiter = Arc::new(MemoryBackend::new(clock.clone()));
         let cache = ResponseCache::new(100, Duration::from_secs(60));
-        let estado = AppState::new(config, upstream_client, limiter, cache, false);
+        let estado = AppState::new(config, upstream_client, limiter, cache, confia_proxy);
         let app = construir_router(estado);
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -173,6 +187,15 @@ impl Harness {
             .send()
             .await
             .expect("GET deve responder")
+    }
+
+    /// `GET` com cabeçalhos — usado para exercitar a identificação do cliente.
+    async fn get_com(&self, caminho: &str, cabecalhos: &[(&str, &str)]) -> reqwest::Response {
+        let mut requisicao = self.cliente.get(self.url(caminho));
+        for (nome, valor) in cabecalhos {
+            requisicao = requisicao.header(*nome, *valor);
+        }
+        requisicao.send().await.expect("GET deve responder")
     }
 
     async fn post(&self, caminho: &str) -> reqwest::Response {
@@ -503,4 +526,65 @@ async fn headers_de_orcamento_tambem_vem_em_requisicao_permitida() {
     assert_eq!(r.status(), StatusCode::OK);
     assert_eq!(header(&r, "RateLimit-Limit"), Some("5"));
     assert!(header(&r, "RateLimit-Remaining").is_some());
+}
+
+#[tokio::test]
+async fn orcamento_segue_o_ip_do_cabecalho_da_borda() {
+    // R4 no nível que importa: não basta extrair o IP corretamente — a chave do
+    // rate limiter tem de ser a extraída, e não o IP da conexão. Aqui as duas
+    // origens aparecem com o mesmo socket (127.0.0.1) e só o cabeçalho difere.
+    let (upstream_addr, _c) = subir_upstream().await;
+    let clock = Arc::new(ManualClock::new(0));
+    let h = Harness::subir_confiando_no_proxy(config_de_teste(upstream_addr, 2, 60), clock).await;
+
+    for _ in 0..2 {
+        let r = h
+            .get_com("/dados", &[("cf-connecting-ip", "203.0.113.10")])
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let esgotado = h
+        .get_com("/dados", &[("cf-connecting-ip", "203.0.113.10")])
+        .await;
+    assert_eq!(
+        esgotado.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "o terceiro pedido do mesmo visitante deveria ser barrado"
+    );
+
+    // Segundo visitante, mesmo balanceador, mesmo socket: orçamento inteiro.
+    // Se a chave viesse do socket, este pedido também seria barrado.
+    let outro = h
+        .get_com("/dados", &[("cf-connecting-ip", "203.0.113.11")])
+        .await;
+    assert_eq!(
+        outro.status(),
+        StatusCode::OK,
+        "visitante diferente não pode herdar o orçamento esgotado do outro"
+    );
+}
+
+#[tokio::test]
+async fn sem_confiar_no_proxy_cabecalho_forjado_nao_abre_orcamento_novo() {
+    // R2: a trava é o que separa "identificação" de "bypass". Sem confiar no
+    // proxy, variar o cabeçalho não pode render orçamento novo — é o ataque
+    // mais simples contra um rate limiter que lê cabeçalho sem verificar.
+    let (upstream_addr, _c) = subir_upstream().await;
+    let clock = Arc::new(ManualClock::new(0));
+    let h = Harness::subir(config_de_teste(upstream_addr, 2, 60), clock).await;
+
+    for _ in 0..2 {
+        let r = h
+            .get_com("/dados", &[("cf-connecting-ip", "203.0.113.10")])
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let forjado = h
+        .get_com("/dados", &[("cf-connecting-ip", "203.0.113.99")])
+        .await;
+    assert_eq!(
+        forjado.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "cabeçalho forjado não deve criar um orçamento novo"
+    );
 }

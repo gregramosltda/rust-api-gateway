@@ -138,7 +138,11 @@ async fn executar() -> Result<(), String> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if confia_proxy {
-        tracing::warn!("GATEWAY_TRUST_PROXY ligado: X-Forwarded-For será considerado");
+        tracing::warn!(
+            "GATEWAY_TRUST_PROXY ligado: CF-Connecting-IP, X-Forwarded-For e \
+             X-Real-IP serão considerados na identificação do cliente — só ligue \
+             atrás de um proxy que reescreva esses cabeçalhos"
+        );
     }
 
     let estado = AppState::new(config, upstream, limiter, cache, confia_proxy);

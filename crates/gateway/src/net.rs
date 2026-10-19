@@ -9,38 +9,72 @@ use axum::http::header;
 use axum::http::HeaderMap;
 use gateway_common::client_identity;
 
+/// Cabeçalho de IP único escrito pela borda da Cloudflare.
+///
+/// É o que o Render (e Fly, e Heroku) entregam: a requisição passa pela borda
+/// antes de chegar ao processo, e a borda **reescreve** este valor. Como o
+/// cliente não consegue escolhê-lo, ele é a fonte mais confiável disponível.
+pub const HEADER_CF_CONNECTING_IP: &str = "cf-connecting-ip";
+/// Cadeia `cliente, proxy1, proxy2`. O cliente pode prefixá-la, então só vale
+/// quando um proxy confiável a reescreve.
+pub const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
+/// Alternativa de IP único usada por alguns proxies (nginx, por exemplo).
+pub const HEADER_X_REAL_IP: &str = "x-real-ip";
+
 /// Extrai o endereço do cliente da requisição.
 ///
-/// Ordem de confiança: `X-Forwarded-For` só é considerado quando `confia_proxy`
-/// está ligado. Sem essa trava, qualquer cliente escreveria o cabeçalho e
-/// burlaria o rate limit, reaproveitando o próprio IP a cada requisição. Com a
-/// trava, assume-se que só um proxy de confiança preencheu o cabeçalho.
+/// Ordem de confiança, quando `confia_proxy` está ligado:
+/// `CF-Connecting-IP` → `X-Forwarded-For` → `X-Real-IP` → IP do socket.
+///
+/// Sem a trava, nenhum cabeçalho é considerado. Ela não é zelo excessivo:
+/// qualquer cliente escreve `X-Forwarded-For`, e sem a trava bastaria variar o
+/// valor para ganhar um orçamento novo a cada requisição, anulando o rate
+/// limit. Com a trava, assume-se que um proxy de confiança reescreveu o
+/// cabeçalho antes de a requisição chegar aqui.
+///
+/// Cabeçalho ausente, vazio, não-UTF8 ou sem IP aproveitável não é erro: cai
+/// para o próximo critério. Uma requisição nunca falha por causa disto.
 pub fn client_ip(
     headers: &HeaderMap,
     socket: Option<std::net::SocketAddr>,
     confia_proxy: bool,
 ) -> String {
     if confia_proxy {
-        if let Some(valor) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            // `XFF` é uma cadeia "cliente, proxy1, proxy2"; o cliente real é o
-            // primeiro. Um cliente malicioso pode prefixar entradas falsas,
-            // então o proxy confiável deve reescrever o cabeçalho.
-            if let Some(primeiro) = valor.split(',').next() {
-                let limpo = client_identity(primeiro);
-                if !limpo.is_empty() {
-                    return limpo;
-                }
-            }
+        if let Some(ip) = valor_unico(headers, HEADER_CF_CONNECTING_IP) {
+            return ip;
         }
-        if let Some(valor) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-            let limpo = client_identity(valor);
-            if !limpo.is_empty() {
-                return limpo;
-            }
+        if let Some(ip) = primeiro_da_cadeia(headers, HEADER_X_FORWARDED_FOR) {
+            return ip;
+        }
+        if let Some(ip) = valor_unico(headers, HEADER_X_REAL_IP) {
+            return ip;
         }
     }
 
     socket.map_or_else(|| "desconhecido".to_owned(), |s| s.ip().to_string())
+}
+
+/// Lê um cabeçalho que carrega um único endereço.
+///
+/// Devolve `None` para ausente, não-UTF8 ou vazio, e é isso que permite ao
+/// chamador tentar o próximo critério sem `unwrap` nenhum.
+fn valor_unico(headers: &HeaderMap, nome: &str) -> Option<String> {
+    let valor = headers.get(nome)?.to_str().ok()?;
+    let limpo = client_identity(valor);
+    (!limpo.is_empty()).then_some(limpo)
+}
+
+/// Lê o primeiro salto de um cabeçalho em forma de cadeia.
+///
+/// O cliente real é o primeiro elemento. Um cliente malicioso pode prefixar
+/// entradas falsas, e é exatamente por isso que este critério fica **depois**
+/// do `CF-Connecting-IP`: só um proxy que reescreve a cadeia torna este valor
+/// confiável.
+fn primeiro_da_cadeia(headers: &HeaderMap, nome: &str) -> Option<String> {
+    let valor = headers.get(nome)?.to_str().ok()?;
+    let primeiro = valor.split(',').next()?;
+    let limpo = client_identity(primeiro);
+    (!limpo.is_empty()).then_some(limpo)
 }
 
 /// Converte `IpAddr` em string estável para usar como chave.
@@ -148,6 +182,87 @@ mod tests {
         let h = headers_com(&[("x-forwarded-for", "1.2.3.4, 10.0.0.1, 10.0.0.2")]);
         let ip = client_ip(&h, Some(socket("10.1.2.3", 5555)), true);
         assert_eq!(ip, "1.2.3.4");
+    }
+
+    #[test]
+    fn cf_connecting_ip_tem_prioridade_sobre_xff() {
+        // R1: a borda da Cloudflare reescreve o CF-Connecting-IP e não permite
+        // que o cliente o escolha; o XFF o cliente prefixa. A ordem importa.
+        let h = headers_com(&[
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("x-forwarded-for", "1.2.3.4, 10.0.0.1"),
+        ]);
+        assert_eq!(
+            client_ip(&h, Some(socket("10.1.2.3", 5)), true),
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn cf_connecting_ip_tem_prioridade_sobre_x_real_ip() {
+        let h = headers_com(&[
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("x-real-ip", "8.8.8.8"),
+        ]);
+        assert_eq!(client_ip(&h, None, true), "203.0.113.7");
+    }
+
+    #[test]
+    fn cf_connecting_ip_e_usado_quando_nao_ha_xff() {
+        let h = headers_com(&[("cf-connecting-ip", "203.0.113.8")]);
+        assert_eq!(
+            client_ip(&h, Some(socket("10.1.2.3", 5)), true),
+            "203.0.113.8"
+        );
+    }
+
+    #[test]
+    fn cf_connecting_ip_e_ignorado_sem_proxy_confiavel() {
+        // R2: o padrão é não confiar. Sem esta trava, o próprio atacante
+        // escolheria o IP da chave de orçamento e o rate limit não valeria nada.
+        let h = headers_com(&[("cf-connecting-ip", "203.0.113.9")]);
+        assert_eq!(
+            client_ip(&h, Some(socket("10.1.2.3", 5)), false),
+            "10.1.2.3",
+            "CF-Connecting-IP não deve ser considerado"
+        );
+    }
+
+    #[test]
+    fn cf_connecting_ip_ausente_usa_o_socket() {
+        // R14: cabeçalho ausente não pode quebrar a requisição.
+        assert_eq!(
+            client_ip(&headers_com(&[]), Some(socket("10.1.2.3", 5)), true),
+            "10.1.2.3"
+        );
+    }
+
+    #[test]
+    fn cf_connecting_ip_vazio_cai_para_o_proximo_criterio() {
+        // R14: valor presente mas inútil não bloqueia a cadeia de fallback.
+        let h = headers_com(&[("cf-connecting-ip", "   "), ("x-forwarded-for", "1.2.3.4")]);
+        assert_eq!(client_ip(&h, Some(socket("10.1.2.3", 5)), true), "1.2.3.4");
+    }
+
+    #[test]
+    fn cf_connecting_ip_com_espacos_e_limpo() {
+        let h = headers_com(&[("cf-connecting-ip", "  203.0.113.10  ")]);
+        assert_eq!(client_ip(&h, None, true), "203.0.113.10");
+    }
+
+    #[test]
+    fn cf_connecting_ip_ipv6_e_preservado_inteiro() {
+        // O separador de porta não pode ser confundido com os dois-pontos do
+        // IPv6: sem isso, `2001:db8::1` viraria `2001:db8:` e todo cliente
+        // IPv6 cairia numa chave só.
+        let h = headers_com(&[("cf-connecting-ip", "2001:db8::1")]);
+        assert_eq!(client_ip(&h, None, true), "2001:db8::1");
+    }
+
+    #[test]
+    fn cf_connecting_ip_vazio_e_sem_socket_nao_quebra() {
+        let h = headers_com(&[("cf-connecting-ip", "")]);
+        assert_eq!(client_ip(&h, None, true), "desconhecido");
     }
 
     #[test]
